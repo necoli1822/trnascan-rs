@@ -25,8 +25,8 @@ rayon = "1.10"
 # which exposes the faithful pipeline as a library API (FaithfulSearcher).
 # version+path: local builds use the path; a crates.io release uses the version
 # (the infernox crates must be published first).
-infernal = { version = "0.1.0", path = "../infernox/infernal" }
-easel = { version = "0.1.0", path = "../infernox/easel" }
+infernal = { package = "infernox-infernal", version = "0.1.0", path = "../infernox/infernal" }
+easel = { package = "infernox-easel", version = "0.1.0", path = "../infernox/easel" }
 
 [dev-dependencies]
 tempfile = "3.8"
