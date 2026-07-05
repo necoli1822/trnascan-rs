@@ -1,0 +1,32 @@
+[package]
+name = "trnascan-rs"
+version = "0.1.0"
+edition = "2021"
+authors = ["Sunju Kim <n.e.coli.1822@gmail.com>"]
+description = "A faithful Rust port of tRNAscan-SE for transfer RNA gene detection in genomic sequences"
+repository = "https://github.com/necoli1822/trnascan-rs"
+homepage = "https://github.com/necoli1822/trnascan-rs"
+license = "GPL-3.0-or-later"
+
+[[bin]]
+name = "trnascan-rs"
+path = "src/bin/trnascan.rs"
+
+[dependencies]
+regex = "1.10"
+once_cell = "1.19"
+clap = { version = "4.4", features = ["derive"] }
+thiserror = "1.0"
+chrono = "0.4"
+lazy_static = "1.4"
+hostname = "0.3"
+rayon = "1.10"
+# Use the completed infernox cmsearch package (byte-parity with C Infernal),
+# which exposes the faithful pipeline as a library API (FaithfulSearcher).
+# version+path: local builds use the path; a crates.io release uses the version
+# (the infernox crates must be published first).
+infernal = { version = "0.1.0", path = "../infernox/infernal" }
+easel = { version = "0.1.0", path = "../infernox/easel" }
+
+[dev-dependencies]
+tempfile = "3.8"

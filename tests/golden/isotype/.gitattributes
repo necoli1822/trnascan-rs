@@ -1,0 +1,7 @@
+# Mark documentation files as documentation
+*.md linguist-documentation
+*.txt linguist-documentation
+
+# Mark golden data as test data
+*scores.txt linguist-generated=false
+*assignments.txt linguist-generated=false

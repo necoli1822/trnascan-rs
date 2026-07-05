@@ -1,0 +1,82 @@
+CM Structure Dump
+=================
+
+Number of nodes: 72
+
+Constants:
+  STATETYPES = 6
+  ALPHASIZE = 4
+  NODETYPES = 7
+
+Node 0: type=6 (ROOT_NODE), nxt=1, nxt2=-1
+Node 1: type=3 (MATR_NODE), nxt=2, nxt2=-1
+Node 2: type=1 (MATP_NODE), nxt=3, nxt2=-1
+Node 3: type=1 (MATP_NODE), nxt=4, nxt2=-1
+Node 4: type=1 (MATP_NODE), nxt=5, nxt2=-1
+Node 5: type=1 (MATP_NODE), nxt=6, nxt2=-1
+Node 6: type=1 (MATP_NODE), nxt=7, nxt2=-1
+Node 7: type=1 (MATP_NODE), nxt=8, nxt2=-1
+Node 8: type=1 (MATP_NODE), nxt=9, nxt2=-1
+Node 9: type=2 (MATL_NODE), nxt=10, nxt2=-1
+Node 10: type=2 (MATL_NODE), nxt=11, nxt2=-1
+Node 11: type=0 (BIFURC_NODE), nxt=12, nxt2=25
+Node 12: type=4 (BEGINL_NODE), nxt=13, nxt2=-1
+Node 13: type=1 (MATP_NODE), nxt=14, nxt2=-1
+Node 14: type=1 (MATP_NODE), nxt=15, nxt2=-1
+Node 15: type=1 (MATP_NODE), nxt=16, nxt2=-1
+Node 16: type=1 (MATP_NODE), nxt=17, nxt2=-1
+Node 17: type=2 (MATL_NODE), nxt=18, nxt2=-1
+Node 18: type=2 (MATL_NODE), nxt=19, nxt2=-1
+Node 19: type=2 (MATL_NODE), nxt=20, nxt2=-1
+Node 20: type=2 (MATL_NODE), nxt=21, nxt2=-1
+Node 21: type=2 (MATL_NODE), nxt=22, nxt2=-1
+Node 22: type=2 (MATL_NODE), nxt=23, nxt2=-1
+Node 23: type=2 (MATL_NODE), nxt=24, nxt2=-1
+Node 24: type=2 (MATL_NODE), nxt=-1, nxt2=-1
+Node 25: type=5 (BEGINR_NODE), nxt=26, nxt2=-1
+Node 26: type=2 (MATL_NODE), nxt=27, nxt2=-1
+Node 27: type=0 (BIFURC_NODE), nxt=28, nxt2=41
+Node 28: type=4 (BEGINL_NODE), nxt=29, nxt2=-1
+Node 29: type=1 (MATP_NODE), nxt=30, nxt2=-1
+Node 30: type=1 (MATP_NODE), nxt=31, nxt2=-1
+Node 31: type=1 (MATP_NODE), nxt=32, nxt2=-1
+Node 32: type=1 (MATP_NODE), nxt=33, nxt2=-1
+Node 33: type=1 (MATP_NODE), nxt=34, nxt2=-1
+Node 34: type=2 (MATL_NODE), nxt=35, nxt2=-1
+Node 35: type=2 (MATL_NODE), nxt=36, nxt2=-1
+Node 36: type=2 (MATL_NODE), nxt=37, nxt2=-1
+Node 37: type=2 (MATL_NODE), nxt=38, nxt2=-1
+Node 38: type=2 (MATL_NODE), nxt=39, nxt2=-1
+Node 39: type=2 (MATL_NODE), nxt=40, nxt2=-1
+Node 40: type=2 (MATL_NODE), nxt=-1, nxt2=-1
+Node 41: type=5 (BEGINR_NODE), nxt=42, nxt2=-1
+Node 42: type=2 (MATL_NODE), nxt=43, nxt2=-1
+Node 43: type=2 (MATL_NODE), nxt=44, nxt2=-1
+Node 44: type=0 (BIFURC_NODE), nxt=45, nxt2=57
+Node 45: type=4 (BEGINL_NODE), nxt=46, nxt2=-1
+Node 46: type=1 (MATP_NODE), nxt=47, nxt2=-1
+Node 47: type=1 (MATP_NODE), nxt=48, nxt2=-1
+Node 48: type=1 (MATP_NODE), nxt=49, nxt2=-1
+Node 49: type=1 (MATP_NODE), nxt=50, nxt2=-1
+Node 50: type=1 (MATP_NODE), nxt=51, nxt2=-1
+Node 51: type=1 (MATP_NODE), nxt=52, nxt2=-1
+Node 52: type=1 (MATP_NODE), nxt=53, nxt2=-1
+Node 53: type=2 (MATL_NODE), nxt=54, nxt2=-1
+Node 54: type=2 (MATL_NODE), nxt=55, nxt2=-1
+Node 55: type=2 (MATL_NODE), nxt=56, nxt2=-1
+Node 56: type=2 (MATL_NODE), nxt=-1, nxt2=-1
+Node 57: type=5 (BEGINR_NODE), nxt=58, nxt2=-1
+Node 58: type=2 (MATL_NODE), nxt=59, nxt2=-1
+Node 59: type=2 (MATL_NODE), nxt=60, nxt2=-1
+Node 60: type=1 (MATP_NODE), nxt=61, nxt2=-1
+Node 61: type=1 (MATP_NODE), nxt=62, nxt2=-1
+Node 62: type=1 (MATP_NODE), nxt=63, nxt2=-1
+Node 63: type=1 (MATP_NODE), nxt=64, nxt2=-1
+Node 64: type=1 (MATP_NODE), nxt=65, nxt2=-1
+Node 65: type=2 (MATL_NODE), nxt=66, nxt2=-1
+Node 66: type=2 (MATL_NODE), nxt=67, nxt2=-1
+Node 67: type=2 (MATL_NODE), nxt=68, nxt2=-1
+Node 68: type=2 (MATL_NODE), nxt=69, nxt2=-1
+Node 69: type=2 (MATL_NODE), nxt=70, nxt2=-1
+Node 70: type=2 (MATL_NODE), nxt=71, nxt2=-1
+Node 71: type=2 (MATL_NODE), nxt=-1, nxt2=-1

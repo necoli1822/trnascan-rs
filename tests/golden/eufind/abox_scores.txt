@@ -1,0 +1,18 @@
+# A-box Detection Golden File
+# Format: position Abox_score ABdist ABdist_score total_score
+
+## Test: A-box detection for tRNA-Phe sequence
+Sequence: TCGCTGTTAGTTACCATCGCACGGATGGCCGAGTGGTCTAAGGCGCCAGACTCAAGCGAAATGCTTGCCTCATGCTCGAGGTCGACTGGGTGTTCTGGTACTCGTATGGGTGCGTGGGTTCGAATCCCACTTCGTGCAG
+
+B-box found at position 116 (score=-1.9170)
+B-box end: 126
+
+Searching for A-box (AB_BOX_DIST_RANGE=116):
+
+Best A-box results:
+  Position:      24 - 43
+  A-box score:   -13.7640
+  AB distance:   72
+  AB dist score: -5.4420
+  Combined:      -21.1230
+

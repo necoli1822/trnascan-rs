@@ -1,0 +1,18 @@
+# B-box Score Detection Golden File
+# Format: position score
+# Cutoff: -14.14
+
+## Test 1: B-box scanning on tRNA-Phe sequence
+Sequence length: 139
+Sequence: TCGCTGTTAGTTACCATCGCACGGATGGCCGAGTGGTCTAAGGCGCCAGACTCAAGCGAAATGCTTGCCTCATGCTCGAGGTCGACTGGGTGTTCTGGTACTCGTATGGGTGCGTGGGTTCGAATCCCACTTCGTGCAG
+
+Position  Score     Status
+--------  --------  ------
+     116   -1.9170  FOUND (end=127)
+
+## Test 2: B-box scanning on artificial sequence with strong pattern
+Sequence length: 155
+
+Position  Score     Status
+--------  --------  ------
+

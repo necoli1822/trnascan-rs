@@ -1,0 +1,129 @@
+Phase 5 Viterbi Core Golden Files
+===================================
+
+Directory: tests/golden/viterbi/
+Generated: 2026-03-04
+Status: ✅ Complete and verified
+
+File Inventory
+--------------
+
+Source Files:
+  gen_viterbi.c      (194 lines) - C test program for generating golden output
+  Makefile           (66 lines)  - Build system for compilation and regeneration
+
+Golden Output Files:
+  viterbi_scores.txt (9 lines)   - Expected alignment scores for 3 test cases
+  traceback.txt      (264 lines) - Complete traceback tree structures
+
+Test Data:
+  test_sequences.fa  (6 lines)   - FASTA format test sequences
+
+Documentation:
+  README.md          (178 lines) - Comprehensive technical documentation
+  SUMMARY.md         (280 lines) - Summary and usage guide
+  INDEX.txt          (this file)  - File inventory and quick reference
+
+Utilities:
+  verify.sh          (98 lines)  - Verification script to check file integrity
+
+Compiled Binary:
+  gen_viterbi        (245 KB)    - Executable test generator
+
+Test Cases
+----------
+
+1. Phe-73bp
+   - Length: 73 bp
+   - Score: 73.8820 bits
+   - Description: Canonical tRNA-Phe from C. elegans
+   - Sequence: GCCTCGATAGCTCAGTTGGGAGAGCGTACGACTGAAGATCGTAAGGTCACCAGTTCGATCCTGGTTCGGGGCA
+
+2. Ser-82bp
+   - Length: 81 bp (note: filename says 82bp, actual is 81)
+   - Score: 66.0850 bits
+   - Description: tRNA-Ser from C. elegans (longer variant)
+   - Sequence: GCAGTCATGTCCGAGTGGTAAGGAGATTGACTAGAAATCAATTGGGCTCTGCCCGCGTAGGTTCGAATCCTGCTGACTGCG
+
+3. Fragment-50bp
+   - Length: 50 bp
+   - Score: -12.8010 bits
+   - Description: Truncated sequence for edge case testing
+   - Sequence: GCCTCGATAGCTCAGTTGGGAGAGCGTACGACTGAAGATCGTAAGGTCAC
+
+Model Information
+-----------------
+
+Model File: ../../original/lib/models/TRNA2.cm
+Model Type: Eukaryotic tRNA covariance model
+Nodes: 72
+States: 289 (after RearrangeCM conversion)
+
+Algorithm Details
+-----------------
+
+Functions Tested:
+  - RearrangeCM()    : Converts floating-point CM to integer model
+  - ViterbiAlign()   : Performs dynamic programming alignment
+  - PrintTrace()     : Outputs traceback tree structure
+
+Key Parameters:
+  - INTPRECISION: 1000.0 (3 decimal places)
+  - Background frequencies: Uniform [0.25, 0.25, 0.25, 0.25] for RNA
+
+State Types (unique flags):
+  - uDEL_ST     (1)   : Deletion state
+  - uMATP_ST    (2)   : Match pair (base pair)
+  - uMATL_ST    (4)   : Match left
+  - uMATR_ST    (8)   : Match right
+  - uINSL_ST    (16)  : Insert left
+  - uINSR_ST    (32)  : Insert right
+  - uBEGIN_ST   (64)  : Begin state
+  - uEND_ST     (128) : End state
+  - uBIFURC_ST  (256) : Bifurcation state
+
+Quick Start
+-----------
+
+1. Verify files:
+   ./verify.sh
+
+2. Regenerate golden files:
+   make generate
+
+3. Clean and rebuild:
+   make clean
+   make gen_viterbi
+   make generate
+
+4. Use in Rust tests:
+   - Parse viterbi_scores.txt for expected scores
+   - Parse traceback.txt for expected tree structures
+   - Compare Rust output with ±0.01 tolerance for scores
+
+References
+----------
+
+Original Implementation:
+  ../../original/src/viterbi.c
+  ../../original/src/debug.c
+  ../../original/src/structs.h
+
+Documentation:
+  README.md  - Full technical details
+  SUMMARY.md - Usage guide and examples
+
+Contact
+-------
+
+For issues or questions about these golden files, see:
+  - README.md for technical details
+  - SUMMARY.md for implementation guidance
+  - gen_viterbi.c source code for algorithm implementation
+
+Version
+-------
+
+Golden Files Version: 1.0
+tRNAscan-SE Version: 2.0
+Generated Date: 2026-03-04
