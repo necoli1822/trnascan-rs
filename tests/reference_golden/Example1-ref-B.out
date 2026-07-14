@@ -1,8 +1,0 @@
-Sequence 		tRNA 	Bounds	tRNA	Anti	Intron Bounds	Inf	      
-Name     	tRNA #	Begin	End  	Type	Codon	Begin	End	Score	Note
--------- 	------	-----	------	----	-----	-----	----	------	------
-CELF22B7 	1	12619	12738	Undet	NNN	0	0	61.3	
-CELF22B7 	2	19480	19561	Ser	AGA	0	0	68.3	
-CELF22B7 	3	26367	26439	Phe	GAA	0	0	67.2	
-CELF22B7 	4	26992	26920	Phe	GAA	0	0	67.2	
-CELF22B7 	5	23765	23694	Pro	CGG	0	0	50.0	

@@ -11,8 +11,6 @@ use std::path::{Path, PathBuf};
 pub struct LogFile {
     file: Option<File>,
     file_name: Option<PathBuf>,
-    #[allow(dead_code)]
-    process_id: u32,
     quiet_mode: bool,
 }
 
@@ -37,7 +35,6 @@ impl LogFile {
         Ok(Self {
             file,
             file_name: log_path.map(|p| p.to_path_buf()),
-            process_id: std::process::id(),
             quiet_mode: quiet,
         })
     }

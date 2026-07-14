@@ -1,12 +1,15 @@
 [package]
 name = "trnascan-rs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["Sunju Kim <n.e.coli.1822@gmail.com>"]
-description = "A faithful Rust port of tRNAscan-SE for transfer RNA gene detection in genomic sequences"
+license = "GPL-3.0-or-later"
+description = "trnascan-rs: a Rust reimplementation of tRNAscan-SE 2.0 for transfer-RNA detection, using the byte-parity infernox (Infernal) covariance-model engine. Argv-faithful drop-in CLI."
 repository = "https://github.com/necoli1822/trnascan-rs"
 homepage = "https://github.com/necoli1822/trnascan-rs"
-license = "GPL-3.0-or-later"
+readme = "README.md"
+keywords = ["bioinformatics", "trna", "trnascan", "rna", "genomics"]
+categories = ["science", "command-line-utilities"]
 
 [[bin]]
 name = "trnascan-rs"
@@ -21,12 +24,15 @@ chrono = "0.4"
 lazy_static = "1.4"
 hostname = "0.3"
 rayon = "1.10"
-# Use the completed infernox cmsearch package (byte-parity with C Infernal),
-# which exposes the faithful pipeline as a library API (FaithfulSearcher).
-# version+path: local builds use the path; a crates.io release uses the version
-# (the infernox crates must be published first).
-infernal = { package = "infernox-infernal", version = "0.1.0", path = "../infernox/infernal" }
-easel = { package = "infernox-easel", version = "0.1.0", path = "../infernox/easel" }
+# Single-crate infernox (byte-parity Infernal cmsearch engine; exposes the
+# faithful library API FaithfulSearcher at the crate root, Easel as
+# `infernox::easel`). Requires infernox >= 0.1.4, which carries the --Fmid fix
+# (the `--mid` pass F3/F3b/F4/F4b/F5 thresholds) that keeps the arch/isotype
+# scan (e.g. Hsalinarum -A Gln) byte-identical to C; 0.1.3 dropped that hit.
+# Publish infernox 0.1.4 first, then this resolves from crates.io.
+# For a local side-by-side source build, override with:
+#   [patch.crates-io] infernox = { path = "../infernox" }
+infernox = "0.1.4"
 
 [dev-dependencies]
 tempfile = "3.8"

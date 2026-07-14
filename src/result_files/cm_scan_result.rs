@@ -21,17 +21,14 @@ pub struct CMscanResultFile {
     path: PathBuf,
     reader: Option<BufReader<File>>,
     indexes: Vec<IndexRecord>,
-    #[allow(dead_code)]
-    file_type: String,
 }
 
 impl CMscanResultFile {
-    pub fn new(path: &Path, file_type: &str) -> Self {
+    pub fn new(path: &Path, _file_type: &str) -> Self {
         Self {
             path: path.to_path_buf(),
             reader: None,
             indexes: Vec::new(),
-            file_type: file_type.to_string(),
         }
     }
 

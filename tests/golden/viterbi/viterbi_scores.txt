@@ -1,8 +1,0 @@
-# Viterbi alignment scores
-# Format: <test_name> <sequence_length> <score>
-# Model: ../../../original/lib/models/TRNA2.cm
-# States: 289
-
-Phe-73bp	73	73.8820
-Ser-82bp	81	66.0850
-Fragment-50bp	50	-12.8010

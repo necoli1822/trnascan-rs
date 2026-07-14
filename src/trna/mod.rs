@@ -293,6 +293,12 @@ pub struct TRna {
     // === tRNA Identity ===
     /// Isotype (amino acid, e.g., "Ala", "Gly")
     pub isotype: String,
+    /// Isotype captured at tRNA creation, BEFORE the Met-family isotype-scan
+    /// promotion (Met→iMet/fMet/Ile2). C caches `tRNAscan_id` at creation and never
+    /// rewrites it, so `--acedb`'s Sequence/Subsequence id keeps the original name
+    /// (e.g. `...-MetCAT`) while Brief_identification/Transcript and the .out/.bed
+    /// use the promoted isotype. Empty ⇒ falls back to `isotype`.
+    pub id_isotype: String,
     /// Anticodon sequence (e.g., "TGC")
     pub anticodon: String,
     /// Anticodon positions
@@ -378,6 +384,13 @@ pub struct TRna {
     pub iso_model: String,
     /// Bit score of the highest-scoring isotype CM model.
     pub iso_score: f64,
+    /// Full per-isotype-model score vector for the `-s`/`--isospecific` `.iso`
+    /// output (C ScanResult.pm construct_isotype_specific_output). Each entry is
+    /// `(model_basename, bit_score)` for an isotype CM that produced a REPORTED hit
+    /// (cmscan default E-value <= 10) on this tRNA's mature sequence. Models absent
+    /// from this list had no reported hit and are written as the `-999` sentinel.
+    /// Populated only when the `.iso` file is requested (scanner `iso_output`).
+    pub iso_all_scores: Vec<(String, f64)>,
 }
 
 impl TRna {

@@ -15,11 +15,11 @@ use std::path::{Path, PathBuf};
 
 use crate::cm_scan::{CMScan, CMScanOptions, CMSearchHit};
 use crate::cm_scan::decode::{
-    decode_trna_properties, find_anticodon, find_intron, format_cmsearch_output, get_trna_type,
-    AliDisplay, UNDEF_ANTICODON, UNDEF_ISOTYPE,
+    decode_mito_tRNA_properties, decode_trna_properties, find_anticodon, find_intron,
+    format_cmsearch_output, get_trna_type, AliDisplay, UNDEF_ANTICODON, UNDEF_ISOTYPE,
 };
 use crate::trna::{AnticodonPos, Intron, TRna, Strand as TStrand, Truncation};
-use infernal::{FaithfulConfig, FaithfulSearcher};
+use infernox::{FaithfulConfig, FaithfulSearcher};
 use once_cell::sync::Lazy;
 use regex::Regex;
 
@@ -33,7 +33,6 @@ static BHB_SS_RE: Lazy<Regex> = Lazy::new(|| {
 use crate::eufind::{run_eufind_scan, EufindOptions, EufindHit};
 use crate::isotype::anticodon_to_isotype;
 use crate::squid::SqInfo;
-use crate::trnascan::{trnascan, ConsensusMatrix, SearchParams, TrnascanHit};
 use crate::trnascan::seq_utils::reverse_complement;
 
 /// Scan mode for different organism types
@@ -76,11 +75,6 @@ impl ScanMode {
             ScanMode::General => "TRNAinf.cm",
             ScanMode::Mitochondrial => "TRNAinf-mito-mammal.cm",
         }
-    }
-
-    /// Check if this mode uses tRNAscan (Fichant-Burks) for first-pass
-    pub fn uses_trnascan(&self) -> bool {
-        matches!(self, ScanMode::Bacterial | ScanMode::Archaeal | ScanMode::General)
     }
 
     /// Check if this mode uses EuFindtRNA for first-pass
@@ -235,20 +229,22 @@ pub struct FirstPassHit {
     pub anticodon: String,
 }
 
-impl FirstPassHit {
-    /// Create from a tRNAscan hit
-    pub fn from_trnascan(hit: &TrnascanHit) -> Self {
-        Self {
-            start: hit.start.max(1) as usize,
-            end: hit.end.max(1) as usize,
-            strand: hit.strand,
-            score: 0.0, // tRNAscan doesn't provide a score
-            source: "tRNAscan".to_string(),
-            isotype: hit.isotype.clone(),
-            anticodon: hit.anticodon.clone(),
-        }
-    }
+/// One merged mitochondrial cmsearch hit (an `ArrayCMscanResults` index entry).
+/// Coordinates are genomic ascending (`start <= end`); `strand` is separate.
+struct MitoIdx {
+    start: i64,
+    end: i64,
+    strand: TStrand,
+    score: f64,
+    /// CM key (e.g. `"Pro"`, `"SerGCT"`, `"Cys_NoDarm"`).
+    model: &'static str,
+    /// Winning-model alidisplay fields (for anticodon decode).
+    aseq: String,
+    ss_cons: String,
+    nc: String,
+}
 
+impl FirstPassHit {
     /// Create from an EuFindtRNA hit
     pub fn from_eufind(hit: &EufindHit) -> Self {
         Self {
@@ -288,6 +284,15 @@ pub struct TrnaScanner {
     verbose: bool,
     /// Show pseudogenes
     show_pseudogenes: bool,
+    /// `-D`/`--nopseudo`: disable pseudogene checking. C sets
+    /// `$cm->skip_pseudo_filter(1)` (tRNAscan-SE:910); the pseudo NOTE is then
+    /// gated off in analyze_with_cmsearch (CM.pm:1242-1245: `pseudo(1)` requires
+    /// `!skip_pseudo_filter`). The HMM/2'Str columns still compute under `-H`.
+    disable_pseudo: bool,
+    /// `--codons`: emit each tRNA's codon (reverse-complement of the anticodon)
+    /// in place of the anticodon, and blank the `.out` "Anti" column header
+    /// (C tRNAscan-SE:916 `output_codon`; ScanResult.pm:69,99-106).
+    output_codon: bool,
     /// Accumulated results
     results: Vec<TrnaResult>,
     /// Accumulated faithful results (bacterial/archaeal/general `-B`/`-A`/`-G` path)
@@ -295,14 +300,6 @@ pub struct TrnaScanner {
 
     // Model paths
     models_dir: PathBuf,
-
-    // First-pass components for tRNAscan (Fichant-Burks)
-    #[allow(dead_code)]
-    tpc_matrix: Option<ConsensusMatrix>,
-    #[allow(dead_code)]
-    d_matrix: Option<ConsensusMatrix>,
-    #[allow(dead_code)]
-    search_params: SearchParams,
 
     // First-pass components for EuFindtRNA
     eufind_options: EufindOptions,
@@ -328,6 +325,32 @@ pub struct TrnaScanner {
     /// `Cren-eury-BHB-noncan.cm` + `Thaum-BHB-noncan.cm`). `Some(vec![])` marks
     /// "already tried, none available" so we don't rebuild every sequence.
     bhb_searchers: RefCell<Option<Vec<FaithfulSearcher>>>,
+    /// `-s`/`--isospecific`: the isotype-specific `.iso` output was requested. When
+    /// set, the isotype CM scan (M5) runs for EVERY tRNA (not just Met) and the FULL
+    /// per-model score vector is retained on each `TRna` (C always runs
+    /// `scan_isotype_cm` when `!no_isotype`; the `.iso` file dumps all model hits).
+    iso_output: bool,
+    /// First-pass candidate count accumulated across all scanned sequences (C
+    /// `stats->trnatotal` — incremented per merged first-pass hit). Feeds the
+    /// `.stats` "tRNAs predicted" / "Candidate tRNAs read" fields.
+    fp_candidate_ct: std::cell::Cell<usize>,
+    /// Sum of first-pass candidate lengths (`end - start + 1`, pre-padding) across
+    /// all sequences (C `stats->fpass_trna_base_ct`). Feeds `.stats` "Bases in tRNAs".
+    fp_candidate_bases: std::cell::Cell<usize>,
+    /// Sum of padded Phase-II window lengths across all sequences (C
+    /// `stats->secpass_base_ct`, the extracted candidate sequence length incl. the
+    /// +/-10 padding). Feeds `.stats` "Bases scanned by Infernal".
+    sp_scanned_bases: std::cell::Cell<usize>,
+    /// User explicitly requested a legacy first-pass (`-e` EufindtRNA / `-t`
+    /// tRNAscan / `-L` legacy / `-C` COVE). Mirrors C tRNAscan-SE where these opts
+    /// leave `infernal_fp=0` (tRNAscan-SE:1514-1531 only sets `infernal_fp(1)` under
+    /// `$opt_inf`), so the DEFAULT Infernal first-pass is bypassed for the legacy
+    /// heuristic path. When set, `uses_faithful()` is forced false.
+    legacy_fp: bool,
+    /// Mitochondrial model set selector (`-M vert` / `-M mammal`). Empty unless
+    /// `mode == Mitochondrial`. Selects which per-isotype mito CM set (vert/mammal)
+    /// the mito engine scans (CM.pm set_file_paths mito branch / conf `mito_cm_*`).
+    mito_model_name: String,
 }
 
 /// No-structure (pseudogene/HMM) and per-isotype CM searchers used by the
@@ -368,19 +391,6 @@ impl TrnaScanner {
         let scan_mode = ScanMode::from_char(mode);
         let models_path = models_dir.as_ref().to_path_buf();
 
-        // Load tRNAscan matrices for prokaryotic modes
-        let (tpc_matrix, d_matrix) = if scan_mode.uses_trnascan() {
-            (Some(ConsensusMatrix::tpc_signal()), Some(ConsensusMatrix::d_signal()))
-        } else {
-            (None, None)
-        };
-
-        // Configure search parameters based on mode
-        let search_params = match scan_mode {
-            ScanMode::Bacterial | ScanMode::Archaeal => SearchParams::relaxed(),
-            _ => SearchParams::strict(),
-        };
-
         // Initialize CM scanner with main and SeC models
         let cm_model_path = models_path.join(scan_mode.cm_model_name());
         let cm_scanner = if cm_model_path.exists() {
@@ -418,12 +428,11 @@ impl TrnaScanner {
             quiet: false,
             verbose: false,
             show_pseudogenes: false,
+            disable_pseudo: false,
+            output_codon: false,
             results: Vec::new(),
             trna_results: Vec::new(),
             models_dir: models_path,
-            tpc_matrix,
-            d_matrix,
-            search_params,
             eufind_options: EufindOptions::default(),
             cm_scanner,
             get_hmm_score: false,
@@ -432,6 +441,12 @@ impl TrnaScanner {
             iso_res: RefCell::new(None),
             scan_searchers: RefCell::new(None),
             bhb_searchers: RefCell::new(None),
+            iso_output: false,
+            fp_candidate_ct: std::cell::Cell::new(0),
+            fp_candidate_bases: std::cell::Cell::new(0),
+            sp_scanned_bases: std::cell::Cell::new(0),
+            legacy_fp: false,
+            mito_model_name: String::new(),
         })
     }
 
@@ -439,24 +454,17 @@ impl TrnaScanner {
     pub fn new_without_model(mode: char, score_cutoff: f64) -> Self {
         let scan_mode = ScanMode::from_char(mode);
 
-        let (tpc_matrix, d_matrix) = if scan_mode.uses_trnascan() {
-            (Some(ConsensusMatrix::tpc_signal()), Some(ConsensusMatrix::d_signal()))
-        } else {
-            (None, None)
-        };
-
         Self {
             mode: scan_mode,
             score_cutoff,
             quiet: false,
             verbose: false,
             show_pseudogenes: false,
+            disable_pseudo: false,
+            output_codon: false,
             results: Vec::new(),
             trna_results: Vec::new(),
             models_dir: PathBuf::from("models"),
-            tpc_matrix,
-            d_matrix,
-            search_params: SearchParams::default(),
             eufind_options: EufindOptions::default(),
             cm_scanner: None,
             get_hmm_score: false,
@@ -465,7 +473,28 @@ impl TrnaScanner {
             iso_res: RefCell::new(None),
             scan_searchers: RefCell::new(None),
             bhb_searchers: RefCell::new(None),
+            iso_output: false,
+            fp_candidate_ct: std::cell::Cell::new(0),
+            fp_candidate_bases: std::cell::Cell::new(0),
+            sp_scanned_bases: std::cell::Cell::new(0),
+            legacy_fp: false,
+            mito_model_name: String::new(),
         }
+    }
+
+    /// `-e`/`-t`/`-L`/`-C`: user requested a legacy first-pass (EufindtRNA /
+    /// tRNAscan / legacy / COVE). Mirrors C leaving `infernal_fp=0`, so the DEFAULT
+    /// Infernal first-pass path is bypassed. See `uses_faithful()`.
+    pub fn set_legacy_first_pass(&mut self, on: bool) {
+        self.legacy_fp = on;
+    }
+
+    /// `-M <model>`: select the mito CM set (`"vert"` / `"mammal"`). C driver
+    /// (tRNAscan-SE:1165) `mito_model(lc($opt_mito))` + `cm_cutoff(15)`.
+    pub fn set_mito_model_name(&mut self, name: &str) {
+        self.mito_model_name = name.to_string();
+        // C tRNAscan-SE:1185 sets cm_cutoff = organelle_cm_cutoff (15) for -M.
+        self.score_cutoff = 15.0;
     }
 
     /// Enable the `-H` HMM Score / 2'Str Score columns (faithful path).
@@ -481,6 +510,40 @@ impl TrnaScanner {
     /// `--no-isotype`: disable the isotype scan + Met-family Type refinement.
     pub fn set_no_isotype(&mut self, on: bool) {
         self.no_isotype = on;
+    }
+
+    /// `-D`/`--nopseudo`: disable pseudogene checking (suppress the `pseudo` note).
+    /// C tRNAscan-SE:910 `$cm->skip_pseudo_filter(1)`.
+    pub fn set_disable_pseudo(&mut self, on: bool) {
+        self.disable_pseudo = on;
+    }
+
+    /// `--codons`: report the codon (reverse-complement of the anticodon) in the
+    /// `.out`/`-f` outputs instead of the anticodon (C tRNAscan-SE:916).
+    pub fn set_output_codon(&mut self, on: bool) {
+        self.output_codon = on;
+    }
+
+    /// `-s`/`--isospecific`: request the isotype-specific `.iso` output. Forces the
+    /// full per-model isotype scan for every tRNA and retention of the full score
+    /// vector on each `TRna`.
+    pub fn set_iso_output(&mut self, on: bool) {
+        self.iso_output = on;
+    }
+
+    /// First-pass candidate count (C `stats->trnatotal`), for the `.stats` writer.
+    pub fn fp_candidate_ct(&self) -> usize {
+        self.fp_candidate_ct.get()
+    }
+
+    /// Sum of first-pass candidate lengths (C `stats->fpass_trna_base_ct`).
+    pub fn fp_candidate_bases(&self) -> usize {
+        self.fp_candidate_bases.get()
+    }
+
+    /// Sum of padded Phase-II window lengths (C `stats->secpass_base_ct`).
+    pub fn sp_scanned_bases(&self) -> usize {
+        self.sp_scanned_bases.get()
     }
 
     /// Isotype-specific scanning applies: the mode ships isotype model DBs
@@ -534,12 +597,15 @@ impl TrnaScanner {
     /// First-pass scan using mode-appropriate method
     fn first_pass_scan(&self, seq: &[u8], seq_name: &str) -> Vec<FirstPassHit> {
         match self.mode {
-            ScanMode::Bacterial | ScanMode::Archaeal => {
-                // Use Infernal HMM-enabled first-pass for prokaryotes (like original tRNAscan-SE)
+            ScanMode::Bacterial | ScanMode::Archaeal | ScanMode::Eukaryotic => {
+                // C DEFAULT (euk/bact/arch): Infernal HMM-enabled first-pass
+                // (tRNAscan-SE:1514-1531 sets infernal_fp=1). EufindtRNA is used
+                // ONLY under -e/-t/-L (opt->infernal_fp=0).
                 self.run_infernal_first_pass(seq, seq_name)
             }
-            ScanMode::Eukaryotic | ScanMode::Organellar | ScanMode::Mitochondrial => {
-                // Use EuFindtRNA for eukaryotes
+            ScanMode::Organellar | ScanMode::Mitochondrial => {
+                // Organellar/mito still route through EuFindtRNA here (not covered
+                // by the Infernal faithful path; distinct per-isotype mito models).
                 self.run_eufind_first_pass(seq, seq_name)
             }
             ScanMode::General => {
@@ -851,17 +917,6 @@ impl TrnaScanner {
         }
     }
 
-    /// Run tRNAscan (Fichant-Burks) first-pass
-    #[allow(dead_code)]
-    fn run_trnascan_first_pass(&self, seq: &[u8]) -> Vec<FirstPassHit> {
-        if let (Some(tpc), Some(d)) = (&self.tpc_matrix, &self.d_matrix) {
-            let hits = trnascan(seq, tpc, d, &self.search_params);
-            hits.iter().map(|h| FirstPassHit::from_trnascan(h)).collect()
-        } else {
-            Vec::new()
-        }
-    }
-
     /// Run EuFindtRNA first-pass
     fn run_eufind_first_pass(&self, seq: &[u8], seq_name: &str) -> Vec<FirstPassHit> {
         let hits = run_eufind_scan(seq, seq_name, &self.eufind_options);
@@ -869,6 +924,41 @@ impl TrnaScanner {
     }
 
     /// Merge overlapping first-pass hits
+    /// C-style first-pass candidate merge for `.stats` accounting only (faithful port
+    /// of `merge_repeat_hit` + `seg_overlap(..., 0)`, CM.pm:3216 / Utils.pm:156): merge
+    /// same-strand hits whose `[start,end]` intervals TRULY overlap (share a base;
+    /// touching endpoints count). Returns the merged `(start,end)` intervals (all
+    /// coords are stored start<=end). Unlike [`Self::merge_overlapping_hits`] (20 bp
+    /// gap → one Phase-II window), this keeps distinct tandem tRNAs separate, so its
+    /// count equals C's first-pass `trnatotal` / "Candidate tRNAs read".
+    fn merge_fp_hits_true_overlap(hits: &[FirstPassHit]) -> Vec<(i64, i64)> {
+        let mut out: Vec<(i64, i64)> = Vec::new();
+        for strand in ['+', '-'] {
+            let mut iv: Vec<(i64, i64)> = hits
+                .iter()
+                .filter(|h| h.strand == strand)
+                .map(|h| (h.start as i64, h.end as i64))
+                .collect();
+            iv.sort_by_key(|&(s, e)| (s, e));
+            let mut cur: Option<(i64, i64)> = None;
+            for (s, e) in iv {
+                match cur {
+                    // Overlap (inclusive): next.start <= current.end.
+                    Some((cs, ce)) if s <= ce => cur = Some((cs, ce.max(e))),
+                    Some(prev) => {
+                        out.push(prev);
+                        cur = Some((s, e));
+                    }
+                    None => cur = Some((s, e)),
+                }
+            }
+            if let Some(prev) = cur {
+                out.push(prev);
+            }
+        }
+        out
+    }
+
     fn merge_overlapping_hits(&self, mut hits: Vec<FirstPassHit>) -> Vec<FirstPassHit> {
         if hits.is_empty() {
             return hits;
@@ -1075,10 +1165,54 @@ impl TrnaScanner {
     /// Whether this mode uses the faithful in-process Infernal `-B`/`-A`/`-G`
     /// pipeline (Phase I candidate scan -> Phase II global-nohmm verify -> decode).
     pub fn uses_faithful(&self) -> bool {
+        // C tRNAscan-SE:767 defaults $opt_euk=1 (EUKARYOTIC is the default mode);
+        // :1266-1301 the euk block sets $opt_inf=1 + CM_mode("infernal"); and
+        // :1514-1531 (`if($opt_inf)`) sets tscan_mode(0)/eufind_mode(0) and, since
+        // euk/bact/arch, infernal_fp(1). So the DEFAULT euk run is an Infernal
+        // first-pass -> Infernal second-pass, identical in structure to bacterial.
+        // The euk main CM is TRNAinf-euk.cm (CM.pm:409 set_file_paths, euk_mode+
+        // infernal_mode) with the Euk SeC model (CM.pm:410) — both already selected
+        // by cm_model_name()/build_faithful_searchers(). EufindtRNA is used ONLY
+        // when the user passes -e/-t/-L (opt->infernal_fp=0 path).
+        if self.legacy_fp {
+            return false;
+        }
+        // Mitochondrial (`-M vert`/`-M mammal`) also runs a fully in-process Infernal
+        // pipeline (per-isotype mito CM scan, `-g --mid --notrunc`), so it uses the
+        // faithful writers (9-col `.out` / GFF / BED). See `faithful_scan_sequence_mito`.
         matches!(
             self.mode,
-            ScanMode::Bacterial | ScanMode::Archaeal | ScanMode::General
+            ScanMode::Bacterial
+                | ScanMode::Archaeal
+                | ScanMode::General
+                | ScanMode::Eukaryotic
+                | ScanMode::Mitochondrial
         )
+    }
+
+    /// The main covariance-model file paths reported in the `.stats` preamble
+    /// ("Covariance model:" + continuation lines). Faithful port of C
+    /// `main_cm_file_path` in sorted-key order (Domain then SeC): the Domain CM
+    /// followed by the SeC CM when present. Only existing files are listed.
+    pub fn covariance_model_paths(&self) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        let main_cm = self.models_dir.join(self.mode.cm_model_name());
+        if main_cm.exists() {
+            paths.push(main_cm);
+        }
+        let sec_name = match self.mode {
+            ScanMode::Bacterial => "TRNAinf-bact-SeC.cm",
+            ScanMode::Archaeal => "TRNAinf-arch-SeC.cm",
+            ScanMode::Eukaryotic => "TRNAinf-euk-SeC.cm",
+            _ => "",
+        };
+        if !sec_name.is_empty() {
+            let p = self.models_dir.join(sec_name);
+            if p.exists() {
+                paths.push(p);
+            }
+        }
+        paths
     }
 
     /// Build the (role, searcher, is_sec_cm) list once for this scan (Domain then
@@ -1187,6 +1321,37 @@ impl TrnaScanner {
                 });
             }
         }
+        // ---- Stats accounting (C Stats.pm): first-pass candidate count/bases and
+        // the second-pass (padded) scanned-base count, accumulated across sequences
+        // for the `-m`/`.stats` writer. C's first-pass candidate list (`fp_tRNAs`) is
+        // the raw (Domain+SeC, both-strand) cmsearch hits merged by TRUE overlap only
+        // (`merge_repeat_hit`, seg_overlap margin 0 — same-strand intervals that share
+        // a base). This is DISTINCT from `merge_overlapping_hits` below, which fuses
+        // hits within a 20 bp GAP into one Phase-II window (tandem tRNAs collapse) for
+        // scan efficiency — that window count is NOT C's candidate count. C increments
+        // `trnatotal` per merged first-pass hit (CM.pm:3205), `fpass_trna_base_ct` by
+        // `end-start+1` per hit (FpScanResultFile.pm:218), and `secpass_base_ct` by the
+        // extracted (+/-10-padded) candidate length per hit (tRNAscan-SE.src:527).
+        {
+            let fp_cands = Self::merge_fp_hits_true_overlap(&candidates);
+            self.fp_candidate_ct
+                .set(self.fp_candidate_ct.get() + fp_cands.len());
+            let mut fp_bases = 0usize;
+            let mut sp_bases = 0usize;
+            for &(cs, ce) in &fp_cands {
+                fp_bases += (ce - cs + 1) as usize;
+                let lo = std::cmp::max(1i64, cs - FLANK);
+                let hi = std::cmp::min(seqlen as i64, ce + FLANK);
+                if hi >= lo {
+                    sp_bases += (hi - lo + 1) as usize;
+                }
+            }
+            self.fp_candidate_bases
+                .set(self.fp_candidate_bases.get() + fp_bases);
+            self.sp_scanned_bases
+                .set(self.sp_scanned_bases.get() + sp_bases);
+        }
+
         let candidates = self.merge_overlapping_hits(candidates);
 
         // ---- Phase II: per-candidate global-nohmm verify + decode ----
@@ -1231,7 +1396,15 @@ impl TrnaScanner {
                 for (role, searcher, is_sec) in searchers.iter() {
                     let fhits = searcher.search(&[region_str.as_str()], &cfg);
                     for h in fhits {
-                        if (h.score as f64) < score_cutoff {
+                        // Apply the cm_cutoff to the score AS REPORTED (rounded to
+                        // 0.1), not the raw bit score. C reads the score back from
+                        // cmsearch's tabular output — already formatted to one
+                        // decimal — then compares `$cm_tRNA->score() < cm_cutoff`
+                        // (CM.pm:3350/3492/3664). So a hit displaying exactly the
+                        // cutoff (e.g. 40.0 at `-X 40`) is kept, matching C's
+                        // inclusive `-T` boundary; comparing the raw f32 (39.9x)
+                        // would drop it. Invisible except at an exact `-X` boundary.
+                        if Self::round1(h.score as f64) < score_cutoff {
                             continue;
                         }
                         let ali = match &h.alignment {
@@ -1348,6 +1521,291 @@ impl TrnaScanner {
         deduped
     }
 
+    /// The per-isotype mitochondrial CM key -> filename map, in Perl `sort keys`
+    /// order (conf `mito_cm_vert.*` / `mito_cm_mammal.*`, tRNAscan-SE.conf:164-186 /
+    /// 139-160). Note `Cys` sorts before `Cys_NoDarm`, and `Cys_NoDarm` maps to the
+    /// irregular filename `TRNAinf-mito-vert-Cys-no-darm.cm`.
+    fn mito_model_specs(&self) -> Vec<(&'static str, &'static str)> {
+        match self.mito_model_name.as_str() {
+            "vert" => vec![
+                ("Ala", "TRNAinf-mito-vert-Ala.cm"),
+                ("Arg", "TRNAinf-mito-vert-Arg.cm"),
+                ("Asn", "TRNAinf-mito-vert-Asn.cm"),
+                ("Asp", "TRNAinf-mito-vert-Asp.cm"),
+                ("Cys", "TRNAinf-mito-vert-Cys.cm"),
+                ("Cys_NoDarm", "TRNAinf-mito-vert-Cys-no-darm.cm"),
+                ("Gln", "TRNAinf-mito-vert-Gln.cm"),
+                ("Glu", "TRNAinf-mito-vert-Glu.cm"),
+                ("Gly", "TRNAinf-mito-vert-Gly.cm"),
+                ("His", "TRNAinf-mito-vert-His.cm"),
+                ("Ile", "TRNAinf-mito-vert-Ile.cm"),
+                ("LeuTAA", "TRNAinf-mito-vert-LeuTAA.cm"),
+                ("LeuTAG", "TRNAinf-mito-vert-LeuTAG.cm"),
+                ("Lys", "TRNAinf-mito-vert-Lys.cm"),
+                ("Met", "TRNAinf-mito-vert-Met.cm"),
+                ("Phe", "TRNAinf-mito-vert-Phe.cm"),
+                ("Pro", "TRNAinf-mito-vert-Pro.cm"),
+                ("SerGCT", "TRNAinf-mito-vert-SerGCT.cm"),
+                ("SerTGA", "TRNAinf-mito-vert-SerTGA.cm"),
+                ("Thr", "TRNAinf-mito-vert-Thr.cm"),
+                ("Trp", "TRNAinf-mito-vert-Trp.cm"),
+                ("Tyr", "TRNAinf-mito-vert-Tyr.cm"),
+                ("Val", "TRNAinf-mito-vert-Val.cm"),
+            ],
+            "mammal" => vec![
+                ("Ala", "TRNAinf-mito-mammal-Ala.cm"),
+                ("Arg", "TRNAinf-mito-mammal-Arg.cm"),
+                ("Asn", "TRNAinf-mito-mammal-Asn.cm"),
+                ("Asp", "TRNAinf-mito-mammal-Asp.cm"),
+                ("Cys", "TRNAinf-mito-mammal-Cys.cm"),
+                ("Gln", "TRNAinf-mito-mammal-Gln.cm"),
+                ("Glu", "TRNAinf-mito-mammal-Glu.cm"),
+                ("Gly", "TRNAinf-mito-mammal-Gly.cm"),
+                ("His", "TRNAinf-mito-mammal-His.cm"),
+                ("Ile", "TRNAinf-mito-mammal-Ile.cm"),
+                ("LeuTAA", "TRNAinf-mito-mammal-LeuTAA.cm"),
+                ("LeuTAG", "TRNAinf-mito-mammal-LeuTAG.cm"),
+                ("Lys", "TRNAinf-mito-mammal-Lys.cm"),
+                ("Met", "TRNAinf-mito-mammal-Met.cm"),
+                ("Phe", "TRNAinf-mito-mammal-Phe.cm"),
+                ("Pro", "TRNAinf-mito-mammal-Pro.cm"),
+                ("SerGCT", "TRNAinf-mito-mammal-SerGCT.cm"),
+                ("SerTGA", "TRNAinf-mito-mammal-SerTGA.cm"),
+                ("Thr", "TRNAinf-mito-mammal-Thr.cm"),
+                ("Trp", "TRNAinf-mito-mammal-Trp.cm"),
+                ("Tyr", "TRNAinf-mito-mammal-Tyr.cm"),
+                ("Val", "TRNAinf-mito-mammal-Val.cm"),
+            ],
+            _ => vec![],
+        }
+    }
+
+    /// Faithful `-M` (mitochondrial) pipeline for one source sequence.
+    ///
+    /// C flow: the driver runs NO first pass in mito mode (`infernal_fp=0`,
+    /// tscan/eufind off), so `prep_for_secpass_only` makes ONE prescan candidate =
+    /// the WHOLE sequence, and `analyze_mito` (CM.pm:3442) runs `run_cmsearch`
+    /// (CM.pm:2591) over every per-isotype mito CM with `exec_cmsearch` scan_flag 1
+    /// (`-g --mid --notrunc`; hmm_filter=1, infernal_fp=0 — CM.pm:2536, driver:1167),
+    /// merges the per-model hits with `ArrayCMscanResults` (overlap_range 10, keep
+    /// higher score), drops hits below `cm_cutoff` (organelle_cm_cutoff = 15), then
+    /// decodes the anticodon (`find_mito_anticodon`) and CCA-extends.
+    fn faithful_scan_sequence_mito(&self, seq: &[u8], seqname: &str, seqlen: usize) -> Vec<TRna> {
+        let specs = self.mito_model_specs();
+        if specs.is_empty() {
+            return Vec::new();
+        }
+        let whole = String::from_utf8_lossy(seq).to_string();
+
+        // C exec_cmsearch scan_flag 1: `-g --mid --notrunc`, both strands (no
+        // --toponly), default E-value reporting (cm_cutoff 15 > 10 => no `-T`).
+        let cfg = FaithfulConfig {
+            toponly: false,
+            global: true,
+            mid: true,
+            notrunc: true,
+            ..Default::default()
+        };
+
+        // ArrayCMscanResults merge state: one MitoIdx per surviving hit. The models
+        // are added in sorted-key order; after each model's hits are appended the
+        // whole list is re-sorted (sort_by_tRNAscanSE_output) and the adjacent-overlap
+        // merge is run (merge_result_file -> merge_indexes, CM.pm ArrayCMscanResults).
+        let mut indexes: Vec<MitoIdx> = Vec::new();
+        for (key, fname) in specs {
+            let path = self.models_dir.join(fname);
+            if !path.exists() {
+                continue;
+            }
+            let searcher = match FaithfulSearcher::from_cm_file(&path) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let fhits = searcher.search(&[whole.as_str()], &cfg);
+            for h in fhits {
+                // Genomic ascending bounds (CMscanResultFile stores start<end for both
+                // strands; the strand is recorded separately).
+                let (start, end, strand) = if h.in_rc {
+                    (h.stop, h.start, TStrand::Minus)
+                } else {
+                    (h.start, h.stop, TStrand::Plus)
+                };
+                let ali = h.alignment.as_ref();
+                indexes.push(MitoIdx {
+                    start,
+                    end,
+                    strand,
+                    score: h.score as f64,
+                    model: key,
+                    aseq: ali.map(|a| a.aseq.clone()).unwrap_or_default(),
+                    ss_cons: ali.map(|a| a.csline.clone()).unwrap_or_default(),
+                    nc: ali.map(|a| a.ncline.clone()).unwrap_or_default(),
+                });
+            }
+            Self::mito_sort(&mut indexes);
+            Self::mito_merge_indexes(&mut indexes, 10);
+        }
+
+        // Decode each surviving merged hit; apply the cm_cutoff (15) filter.
+        let mut out: Vec<TRna> = Vec::new();
+        for idx in &indexes {
+            if idx.score < self.score_cutoff {
+                // C analyze_mito:3492 logs+skips below-cutoff hits.
+                continue;
+            }
+            // C analyze_mito:3487-3490: subseq bounds; +prescan_start-1 is inert here
+            // (prescan start = 1 for the whole-sequence candidate).
+            let subseq_start = idx.start; // genomic ascending min
+            let mut subseq_end = idx.end; // genomic ascending max
+
+            let ali = AliDisplay {
+                aseq: idx.aseq.clone(),
+                ss_cons: idx.ss_cons.clone(),
+                nc: idx.nc.clone(),
+                model: String::new(),
+            };
+            let dec = decode_mito_tRNA_properties(&ali, idx.model);
+
+            // Mito Note column (ScanResult.pm:840-863): emitted ONLY with `--detail`.
+            // Without it the Note is always empty (a trailing tab). With `--detail`:
+            // `category` (with `mito_` stripped) then, if a decode note exists, joined
+            // by " " when the note starts with "(" else ";".
+            let note = if self.detail {
+                if !dec.category.is_empty() {
+                    let mut n = dec.category.replace("mito_", "");
+                    if !dec.note.is_empty() {
+                        if dec.note.starts_with('(') {
+                            n = format!("{} {}", n, dec.note);
+                        } else {
+                            n = format!("{};{}", n, dec.note);
+                        }
+                    }
+                    n
+                } else {
+                    dec.note.clone()
+                }
+            } else {
+                String::new()
+            };
+
+            // Strand-oriented coords (analyze_mito:3506-3511 swaps for `-`).
+            let (mut t_start, mut t_end) = match idx.strand {
+                TStrand::Minus => (idx.end, idx.start),
+                _ => (idx.start, idx.end),
+            };
+
+            // CCA acceptor extension (analyze_mito:3513-3528): if the 3 forward-genome
+            // bases immediately after the ascending end are "CCA" and the tRNA ss does
+            // NOT already end in "...." then append CCA (+3 on the 3' coord).
+            let mut fin_seq = dec.norm_seq.clone().into_bytes();
+            let mut fin_ss = dec.norm_ss.clone().into_bytes();
+            {
+                let se = subseq_end as usize; // 1-based ascending end
+                let cca_ok = seqlen >= se + 2
+                    && se + 3 <= seq.len()
+                    && seq[se..se + 3].eq_ignore_ascii_case(b"CCA");
+                let ss_tail_dots = fin_ss.len() >= 4 && &fin_ss[fin_ss.len() - 4..] == b"....";
+                if cca_ok && !ss_tail_dots {
+                    subseq_end += 3;
+                    match idx.strand {
+                        TStrand::Minus => t_start -= 3,
+                        _ => t_end += 3,
+                    }
+                    fin_seq.extend_from_slice(b"CCA");
+                    fin_ss.extend_from_slice(b"...");
+                }
+            }
+            // Both are faithful bookkeeping of C's subseq bounds (analyze_mito:3513);
+            // R tracks the genomic coords in t_start/t_end, so the locals are write-only.
+            let _ = (subseq_start, subseq_end);
+
+            // `t_start`/`t_end` hold C's final strand-oriented (Begin, End) after the
+            // minus-strand swap + CCA quirk (analyze_mito:3506-3528). The faithful
+            // `TRna`/writer convention (like the main path) stores ASCENDING bounds
+            // and re-derives strand-oriented Begin/End at output time
+            // (`write_faithful_out` swaps for `-`). Store ascending here so minus
+            // hits print Begin=higher-coord/End=lower-coord like C.
+            let mut t = TRna::new();
+            t.seqname = seqname.to_string();
+            t.strand = idx.strand;
+            t.start = t_start.min(t_end);
+            t.end = t_start.max(t_end);
+            t.score = idx.score;
+            t.set_domain_model("infernal", idx.score);
+            t.isotype = dec.isotype.clone();
+            t.anticodon = dec.anticodon.clone();
+            t.note = note;
+            t.model = idx.model.to_string();
+            t.hit_source = "Inf".to_string();
+            t.src_seqlen = seqlen;
+            Self::populate_seq_fields(&mut t, fin_seq, fin_ss);
+            out.push(t);
+        }
+
+        // Output sort + per-sequence numbering (IntResultFile sort_by_tRNAscanSE_output,
+        // identical order to the merge sort).
+        Self::sort_faithful(&mut out);
+        for (i, t) in out.iter_mut().enumerate() {
+            t.id = i + 1;
+        }
+        out
+    }
+
+    /// Sort mito merge indexes by `sort_by_tRNAscanSE_output`
+    /// (ArrayCMscanResults.pm:203): seqname (single seq here), then `+` strand before
+    /// `-`; within `+` by start asc then score desc; within `-` by end desc then
+    /// score desc.
+    fn mito_sort(v: &mut [MitoIdx]) {
+        v.sort_by(|a, b| {
+            let ra = if a.strand == TStrand::Plus { 0 } else { 1 };
+            let rb = if b.strand == TStrand::Plus { 0 } else { 1 };
+            ra.cmp(&rb).then_with(|| {
+                let by_score = b
+                    .score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal);
+                if a.strand == TStrand::Plus {
+                    a.start.cmp(&b.start).then(by_score)
+                } else {
+                    b.end.cmp(&a.end).then(by_score)
+                }
+            })
+        });
+    }
+
+    /// `seg_overlap` (Utils.pm:156) with a nonzero range: the two ascending segments
+    /// [a1,a2],[b1,b2] "overlap" if any of their four endpoints lies within `range`
+    /// of the matching endpoint of the other segment.
+    fn mito_seg_overlap(a1: i64, a2: i64, b1: i64, b2: i64, range: i64) -> bool {
+        (a1 >= b1 - range && a1 <= b1 + range)
+            || (a2 >= b2 - range && a2 <= b2 + range)
+            || (b1 >= a1 - range && b1 <= a1 + range)
+            || (b2 >= a2 - range && b2 <= a2 + range)
+    }
+
+    /// `merge_indexes` (ArrayCMscanResults.pm:179): a single downward pass removing,
+    /// for each adjacent same-seqname overlapping pair, the lower-scoring member
+    /// (`>=` keeps the earlier index).
+    fn mito_merge_indexes(v: &mut Vec<MitoIdx>, range: i64) {
+        if v.len() < 2 {
+            return;
+        }
+        let mut i: i64 = v.len() as i64 - 2;
+        while i >= 0 {
+            let ii = i as usize;
+            let overlap =
+                Self::mito_seg_overlap(v[ii].start, v[ii].end, v[ii + 1].start, v[ii + 1].end, range);
+            if overlap {
+                if v[ii].score >= v[ii + 1].score {
+                    v.remove(ii + 1);
+                } else {
+                    v.remove(ii);
+                }
+            }
+            i -= 1;
+        }
+    }
+
     /// Truncated tRNA search (C: CM.pm truncated_tRNA_search 2653 + check_truncation
     /// 2718). Re-scans each found tRNA's MATURE sequence with a truncation-allowed
     /// search (`notrunc:false`, the infernox port of C's `-g --toponly` flag-6) and,
@@ -1402,7 +1860,7 @@ impl TrnaScanner {
             };
             let hits = searcher.search(&[mature.as_str()], &cfg);
             // Best-scoring hit (the pipeline reports the highest-scoring parse).
-            let best = hits.iter().fold(None::<&infernal::FaithfulHit>, |acc, h| {
+            let best = hits.iter().fold(None::<&infernox::FaithfulHit>, |acc, h| {
                 match acc {
                     Some(a) if a.score >= h.score => Some(a),
                     _ => Some(h),
@@ -1431,7 +1889,7 @@ impl TrnaScanner {
     /// cto_span-cto_emit (3', `*[N]>`). The 3' side carries a CCA exclusion:
     /// a small (<=3) 3'-only overhang on a non-CCA-tailed, non-5'-truncated
     /// bact/arch tRNA is NOT labelled (it is the missing CCA, not a truncation).
-    fn check_truncation(h: &infernal::FaithfulHit, mature: &str, is_euk_general: bool) -> String {
+    fn check_truncation(h: &infernox::FaithfulHit, mature: &str, is_euk_general: bool) -> String {
         let mut label = String::new();
         if h.trunc.is_empty() || h.trunc == "no" {
             return label;
@@ -1818,7 +2276,14 @@ impl TrnaScanner {
             }
         }
 
-        // ---- rescore — CM.pm:3754-3757 -> rescore_tRNA -> cmsearch_scoring flag 7 ----
+        // ---- rescore — CM.pm:3752-3755 -> rescore_tRNA (updates the `infernal`
+        // domain model), IMMEDIATELY followed by `set_default_scores()` at
+        // CM.pm:3773 which copies the infernal domain score back into
+        // `$trna->score()` (tRNA.pm:set_default_scores). So the CCA boundary
+        // trim/extend rescore IS reflected in the reported `.out` score — update
+        // BOTH `t.score` and the domain model here. (This differs from
+        // fix_fMet/fix_His, which run AFTER set_default_scores and therefore leave
+        // `t.score` frozen — see those two functions.)
         if rescore {
             let adj: String = seq.iter().map(|&b| b as char).collect();
             if let Some(sc) = Self::ns_max_score(searcher, &adj) {
@@ -1852,14 +2317,17 @@ impl TrnaScanner {
         let old = t.score;
         if Self::fix_fmet_transform(t, seq, ss, genome) {
             let adj: String = seq.iter().map(|&b| b as char).collect();
+            // C fix_fMet -> rescore_tRNA updates ONLY the `infernal` domain model,
+            // not `$trna->score()`; the reported `.out` score stays frozen. See the
+            // matching note in `apply_boundary_adjust`.
             if let Some(sc) = Self::ns_max_score(searcher, &adj) {
-                t.score = sc;
                 t.set_domain_model("infernal", sc);
             }
             if std::env::var("FIX_DEBUG").is_ok() {
+                let ds = t.get_domain_model("infernal").map(|d| d.score).unwrap_or(old);
                 eprintln!(
-                    "FIX_FMET fired: {} {}-{} score {}->{}",
-                    t.seqname, t.start, t.end, old, t.score
+                    "FIX_FMET fired: {} {}-{} _score={} domain->{}",
+                    t.seqname, t.start, t.end, old, ds
                 );
             }
         }
@@ -1875,7 +2343,10 @@ impl TrnaScanner {
         ss: &mut Vec<u8>,
         genome: &[u8],
     ) -> bool {
-        if t.isotype != "Met" || t.score <= 40.0 {
+        // C fix_fMet gate (CM.pm:1359-1362): `$inf->{score} > 40` reads the `infernal`
+        // DOMAIN model score (post-boundary-adjust rescore), NOT `$trna->score()`.
+        let inf_score = t.get_domain_model("infernal").map(|d| d.score).unwrap_or(t.score);
+        if t.isotype != "Met" || inf_score <= 40.0 {
             return false;
         }
         let plus = t.strand == TStrand::Plus;
@@ -1978,14 +2449,18 @@ impl TrnaScanner {
         let old = t.score;
         if Self::fix_his_transform(t, seq, ss) {
             let adj: String = seq.iter().map(|&b| b as char).collect();
+            // C fix_His -> rescore_tRNA updates ONLY the `infernal` domain model,
+            // not `$trna->score()`; the reported `.out` score stays frozen at the
+            // pre-fix value (verified against instrumented C: _score 48.7 unchanged
+            // while the domain model drops to 48.6). See `apply_boundary_adjust`.
             if let Some(sc) = Self::ns_max_score(searcher, &adj) {
-                t.score = sc;
                 t.set_domain_model("infernal", sc);
             }
             if std::env::var("FIX_DEBUG").is_ok() {
+                let ds = t.get_domain_model("infernal").map(|d| d.score).unwrap_or(old);
                 eprintln!(
-                    "FIX_HIS fired: {} {}-{} score {}->{}",
-                    t.seqname, t.start, t.end, old, t.score
+                    "FIX_HIS fired: {} {}-{} _score={} domain->{}",
+                    t.seqname, t.start, t.end, old, ds
                 );
             }
         }
@@ -1994,7 +2469,10 @@ impl TrnaScanner {
     /// Pure geometric transform of `fix_His` (no rescore), returning `true` if the
     /// rule fired. Split out for unit-testing the exact C conditions.
     fn fix_his_transform(t: &mut TRna, seq: &mut Vec<u8>, ss: &mut Vec<u8>) -> bool {
-        if t.isotype != "His" || t.score <= 35.0 {
+        // C fix_His gate (CM.pm:1443-1446): `$inf->{score} > 35` reads the `infernal`
+        // DOMAIN model score (post-boundary-adjust rescore), NOT `$trna->score()`.
+        let inf_score = t.get_domain_model("infernal").map(|d| d.score).unwrap_or(t.score);
+        if t.isotype != "His" || inf_score <= 35.0 {
             return false;
         }
         let n = ss.len();
@@ -2092,12 +2570,22 @@ impl TrnaScanner {
     /// M5 isotype scan — C flag 2: `-g --mid --toponly --notrunc` (cmscan).
     /// `--mid` (HMM-banded global final Inside) matches the golden isotype
     /// scores; `--nohmm` (QDB) differs by ~0.1 bit on some models (e.g. His).
+    ///
+    /// `e_report: 10.0` reproduces cmscan's DEFAULT reporting threshold (C
+    /// `exec_cmscan` scan_flag 2 adds no `-E`/`-T`): a model whose best hit has
+    /// E-value > 10 is not written to the tblout, so `scan_isotype_cm` stores an
+    /// empty column → the `.iso` writer emits `-999`. `best_score` returns `None`
+    /// there. For a reported model, the best (max-score) reported hit's bit score is
+    /// returned — the value cmscan's tblout `score` column carries. Any hit at or
+    /// above the isotype cutoff (20) is far below E=10 on a ~76 nt tRNA, so the
+    /// `>= cutoff` refinement subset is identical to the pre-threshold set: the main
+    /// `.out` Met-family Type refinement and `--detail` Isotype columns are unchanged.
     fn iso_mid_score(searcher: &FaithfulSearcher, seq: &str) -> Option<f64> {
         // toponly: the mature span is coding-oriented (see ns_max_score) — top strand
         // holds the isotype hit; scoring one strand is byte-identical and halves work.
         let cfg = FaithfulConfig {
             toponly: true,
-            e_report: 1e9,
+            e_report: 10.0,
             global: true,
             mid: true,
             ..Default::default()
@@ -2113,7 +2601,9 @@ impl TrnaScanner {
         // with no Met tRNA skips the (expensive) iso-searcher build entirely.
         let iso_on = self.iso_applicable();
         let has_met = iso_on && trnas.iter().any(|t| t.isotype == "Met");
-        let need_iso = self.detail && iso_on || has_met;
+        // `-s`/`.iso` forces the full per-model scan for EVERY tRNA (C always runs
+        // scan_isotype_cm when !no_isotype; the `.iso` file dumps every model hit).
+        let need_iso = (self.detail || self.iso_output) && iso_on || has_met;
         // Pseudogene filter (C is_pseudo_gene, CM.pm:999) runs for any tRNA with
         // Inf score < 55 even in the default view, so we must not early-return when
         // such candidates exist — they still need the NS rescore + pseudo check.
@@ -2130,6 +2620,9 @@ impl TrnaScanner {
         let cutoff = self.isotype_cutoff();
         let get_hmm_score = self.get_hmm_score;
         let detail = self.detail;
+        let iso_output = self.iso_output;
+        let mode = self.mode;
+        let disable_pseudo = self.disable_pseudo;
 
         // Each tRNA's decoration is independent; the NS rescore (M4) and the 23
         // isotype rescores (M5) are the pipeline's dominant cost (non-banded --max /
@@ -2143,6 +2636,13 @@ impl TrnaScanner {
             }
             let mature = Self::faithful_mature_seq(t, &span);
             let is_sec = t.model == "SeC";
+
+            // Cache the pre-promotion isotype for `--acedb`'s tRNAscan_id (C caches
+            // tRNAscan_id at creation; the Met→iMet/fMet/Ile2 promotion below never
+            // rewrites it). All other outputs use the live (promoted) isotype.
+            if t.id_isotype.is_empty() {
+                t.id_isotype = t.isotype.clone();
+            }
 
             // ---- M4: HMM Score + 2'Str Score (spec §2.3) + pseudogene filter ----
             // C (is_pseudo_gene, CM.pm:999): for Inf score < 55 the NS rescore +
@@ -2159,14 +2659,18 @@ impl TrnaScanner {
                 let ss = Self::round1(t.score) - hmm;
                 // Pseudogene: (ss_score < min_ss_score 5 OR hmm_score < min_hmm_score
                 // 10) AND Inf score < min_pseudo_filter_score 55.
-                if (ss < 5.0 || hmm < 10.0) && t.score < 55.0 {
+                // C CM.pm:1242-1245 gates `$trna->pseudo(1)` on `!skip_pseudo_filter`,
+                // so `-D`/`--nopseudo` suppresses the note even when is_pseudo_gene
+                // would fire — while the HMM/2'Str columns above still compute for -H.
+                if (ss < 5.0 || hmm < 10.0) && t.score < 55.0 && !disable_pseudo {
                     t.is_pseudo = true;
                 }
-                // The HMM/2'Str columns are only displayed under -H.
-                if get_hmm_score {
-                    t.hmm_score = hmm;
-                    t.ss_score = ss;
-                }
+                // Store HMM/2'Str whenever they are computed (score<55 or -H). They
+                // are only *displayed* under -H (the `.out`/`-f` writers gate on the
+                // flag), but the `--acedb` pseudogene Remark reads them for any
+                // pseudo tRNA without -H (C computes them in is_pseudo_gene too).
+                t.hmm_score = hmm;
+                t.ss_score = ss;
             } else if get_hmm_score && is_sec {
                 // SeC hits skip the pseudogene / NS rescore; -H shows 0.00/0.00.
                 t.hmm_score = 0.0;
@@ -2175,26 +2679,34 @@ impl TrnaScanner {
 
             // ---- M5: Isotype scan + Met-family Type refinement (spec §2.5) ----
             // Default view: only Met tRNAs need the scan (that's the only Type that
-            // the isotype models can change). --detail: scan every tRNA for the
-            // extra Isotype CM / Score columns + IPD note.
-            let want_iso = iso_on && (detail || t.isotype == "Met");
+            // the isotype models can change). --detail / -s: scan every tRNA for the
+            // extra Isotype CM / Score columns + IPD note / the `.iso` matrix.
+            let want_iso = iso_on && (detail || iso_output || t.isotype == "Met");
             let mut recorded: Vec<(String, f64)> = Vec::new();
             if want_iso {
                 // Parallel over the 23 isotype models; `collect` preserves `res.iso`
                 // order so the tie-break fold below is identical to the serial loop.
-                recorded = res
+                // `all_scored` keeps EVERY reported model (cmscan E<=10), including
+                // below-cutoff scores — this is the `.iso` matrix (C
+                // construct_isotype_specific_output prints the tblout score for any
+                // reported model, `-999` otherwise). `recorded` is the `>= cutoff`
+                // subset used for the Type refinement (C get_highest_score_model /
+                // Ile2 logic operate on the stored hits; the cutoff drops only the
+                // weak below-20 hits that never win, so the refinement is unchanged).
+                let all_scored: Vec<(String, f64)> = res
                     .iso
                     .par_iter()
                     .filter_map(|(name, s)| {
-                        Self::iso_mid_score(s, &mature).and_then(|sc| {
-                            let sc = Self::round1(sc);
-                            if sc >= cutoff {
-                                Some((name.clone(), sc))
-                            } else {
-                                None
-                            }
-                        })
+                        Self::iso_mid_score(s, &mature)
+                            .map(|sc| (name.clone(), Self::round1(sc)))
                     })
+                    .collect();
+                if iso_output {
+                    t.iso_all_scores = all_scored.clone();
+                }
+                recorded = all_scored
+                    .into_iter()
+                    .filter(|(_, sc)| *sc >= cutoff)
                     .collect();
                 // Highest-scoring model (ties: keep the first / alphabetically
                 // earlier, matching the sorted split order).
@@ -2280,6 +2792,26 @@ impl TrnaScanner {
                     note.push(',');
                 }
                 note.push_str(&t.trunc_label);
+            }
+            // Archaeal intron-type note (C construct_tab_output ScanResult.pm:800-825):
+            // under --detail, when `search_mode eq "archaea"` and the tRNA has any
+            // intron, append "CI" if any canonical intron is present and "NCI" if any
+            // noncanonical (BHB) intron is present (each at most once, CI before NCI).
+            if detail && mode == ScanMode::Archaeal && !t.introns.is_empty() {
+                let ci = t.introns.iter().any(|i| i.intron_type == "CI");
+                let nci = t.introns.iter().any(|i| i.intron_type == "NCI");
+                if ci {
+                    if !note.is_empty() {
+                        note.push(',');
+                    }
+                    note.push_str("CI");
+                }
+                if nci {
+                    if !note.is_empty() {
+                        note.push(',');
+                    }
+                    note.push_str("NCI");
+                }
             }
             t.note = note;
         });
@@ -2495,8 +3027,8 @@ impl TrnaScanner {
         bhb: &[FaithfulSearcher],
         target: &str,
         cfg: &FaithfulConfig,
-    ) -> Vec<infernal::FaithfulHit> {
-        let mut cand: Vec<infernal::FaithfulHit> = Vec::new();
+    ) -> Vec<infernox::FaithfulHit> {
+        let mut cand: Vec<infernox::FaithfulHit> = Vec::new();
         for s in bhb {
             cand.extend(s.search(&[target], cfg));
         }
@@ -2530,7 +3062,7 @@ impl TrnaScanner {
     fn check_intron_validity(
         &self,
         t: &mut TRna,
-        hit: &infernal::FaithfulHit,
+        hit: &infernox::FaithfulHit,
         padded_seq: &str,
         padded_full: &str,
         prev_len: i64,
@@ -2581,7 +3113,7 @@ impl TrnaScanner {
         clip.push_str(&padded_seq[hi..]);
 
         // ---- Re-score the mature candidate with the main CM(s) (C :1946-1964) ----
-        let mut mhits: Vec<(&'static str, infernal::FaithfulHit)> = Vec::new();
+        let mut mhits: Vec<(&'static str, infernox::FaithfulHit)> = Vec::new();
         for (role, s, _is_sec) in main.iter() {
             for mh in s.search(&[clip.as_str()], main_cfg) {
                 mhits.push((*role, mh));
@@ -2767,7 +3299,7 @@ impl TrnaScanner {
     /// C `sort_by_tRNAscanSE_output` + `merge_overlapping_hits(0)` for the main
     /// clip re-score hits: sort by start ascending (then score descending) and
     /// drop lower-scoring hits that overlap an adjacent kept hit.
-    fn merge_main_hits(hits: &mut Vec<(&'static str, infernal::FaithfulHit)>) {
+    fn merge_main_hits(hits: &mut Vec<(&'static str, infernox::FaithfulHit)>) {
         hits.sort_by(|a, b| {
             a.1.start
                 .cmp(&b.1.start)
@@ -2845,7 +3377,7 @@ impl TrnaScanner {
         let mat_seq = Self::splice_introns(&precursor, &introns);
 
         if !mat_seq.eq_ignore_ascii_case(&t.mat_seq) {
-            let mut mhits: Vec<(&'static str, infernal::FaithfulHit)> = Vec::new();
+            let mut mhits: Vec<(&'static str, infernox::FaithfulHit)> = Vec::new();
             for (role, s, _is_sec) in main.iter() {
                 for mh in s.search(&[mat_seq.as_str()], main_cfg) {
                     mhits.push((*role, mh));
@@ -3136,18 +3668,21 @@ impl TrnaScanner {
         let first = match self.trna_results.first() {
             Some(t) => t,
             None => {
-                // No tRNAs: still emit the header (unless brief) with default widths.
-                if !brief {
-                    write_faithful_header(writer, 8, 1, hmm, detail)?;
-                }
+                // No tRNAs found -> write NOTHING (empty .out), matching C.
+                // C's `print_results_header` (ScanResult.pm:362) is called INSIDE
+                // the per-result loop guarded by `!$printed_header`, so with zero
+                // results the header is never emitted and the `.out` is 0 bytes
+                // (verified: C `-O` on an organelle genome with no euk-CM hits
+                // produces an empty file). Emitting a header here diverged.
                 return Ok(());
             }
         };
         let w = std::cmp::max(first.seqname.len() + 1, 8);
         let l = format!("{}", first.src_seqlen).len().max(1);
 
+        let output_codon = self.output_codon;
         if !brief {
-            write_faithful_header(writer, w, l, hmm, detail)?;
+            write_faithful_header(writer, w, l, hmm, detail, output_codon)?;
         }
 
         for t in &self.trna_results {
@@ -3175,6 +3710,13 @@ impl TrnaScanner {
                 }
                 (bs.join(","), es.join(","))
             };
+            // `--codons`: report the codon (reverse-complement) instead of the
+            // anticodon (C ScanResult.pm:663-666 `rev_comp_seq($tRNA->anticodon())`).
+            let triplet = if output_codon {
+                rev_comp_seq(&t.anticodon)
+            } else {
+                t.anticodon.clone()
+            };
             // Base 9 columns through Inf Score (raw, no printf).
             write!(
                 writer,
@@ -3184,7 +3726,7 @@ impl TrnaScanner {
                 begin,
                 end,
                 t.isotype,
-                t.anticodon,
+                triplet,
                 ibeg,
                 iend,
                 t.score,
@@ -3201,6 +3743,100 @@ impl TrnaScanner {
             }
             // Note (always the trailing column; leading TAB, then note body).
             writeln!(writer, "\t{}", t.note)?;
+        }
+        Ok(())
+    }
+
+    /// `--acedb`: ACeDB-format output (faithful port of C `output_tRNA`'s
+    /// `save_Acedb_from_secpass`, ScanResult.pm:962). One record per final tRNA in
+    /// `trna_results` order; zero tRNAs ⇒ empty file (C opens ACEOUT for append
+    /// inside the per-result loop, like the lazy tabular header).
+    pub fn write_faithful_acedb<W: Write>(&self, writer: &mut W) -> IoResult<()> {
+        const PROGRAM_ID: &str = concat!("trnascan-rs-", env!("CARGO_PKG_VERSION"));
+        let output_codon = self.output_codon;
+        for t in &self.trna_results {
+            // C `save_Acedb_from_secpass` prints the RAW `$tRNA->start()/end()`
+            // (stored ascending: min..max) — NOT the strand-swapped `.out` display
+            // coords. So even a minus-strand tRNA shows start < end here.
+            let (begin, end) = (t.start, t.end);
+            // tRNAscan_id uses the ORIGINAL (pre-promotion) isotype (C caches it at
+            // creation); Brief_identification/Transcript below use the live isotype.
+            let id_isotype = if t.id_isotype.is_empty() {
+                &t.isotype
+            } else {
+                &t.id_isotype
+            };
+            let id = format!("{}.tRNA{}-{}{}", t.seqname, t.id, id_isotype, t.anticodon);
+            write!(
+                writer,
+                "Sequence\t{}\nSubsequence\t{} {} {}\n\n",
+                t.seqname, id, begin, end
+            )?;
+            write!(writer, "Sequence\t{}\nSource\t\t{}\n", id, t.seqname)?;
+            // Source_Exons for the (first) intron (C save_Acedb_from_secpass:969-973).
+            if !t.introns.is_empty() {
+                let mut ordered: Vec<&Intron> = t.introns.iter().collect();
+                ordered.sort_by_key(|i| i.rel_start);
+                let first = ordered[0];
+                write!(writer, "Source_Exons\t1 {}\n", first.rel_start - 1)?;
+                write!(
+                    writer,
+                    "Source_Exons\t{} {}\n",
+                    first.rel_end + 1,
+                    (end - begin).abs() + 1
+                )?;
+            }
+            write!(writer, "Brief_identification tRNA-{}\n", t.isotype)?;
+            // `--codons`: codon (reverse-complement) instead of anticodon.
+            let triplet = if output_codon {
+                rev_comp_seq(&t.anticodon)
+            } else {
+                t.anticodon.clone()
+            };
+            // C interpolates `one_let_trans_map->{isotype}`; unmapped isotypes
+            // (fMet/iMet/Ile2) yield the empty string.
+            let one_letter = acedb_one_letter(&t.isotype)
+                .map(|c| c.to_string())
+                .unwrap_or_default();
+            write!(
+                writer,
+                "Transcript tRNA \"{} {} {}\"\nScore {} {:.1}\n",
+                triplet, t.isotype, one_letter, PROGRAM_ID, t.score
+            )?;
+            if t.is_pseudo {
+                write!(
+                    writer,
+                    "Remark \"Likely pseudogene (HMM Sc={:.2} / Sec struct Sc={:.2})\"\n",
+                    t.hmm_score, t.ss_score
+                )?;
+            }
+            write!(writer, "\n")?;
+        }
+        Ok(())
+    }
+
+    /// `-w <file>`: save tRNAs with an uncallable anticodon (Undet/NNN) — faithful
+    /// port of the odd-struct writer (CM.pm:1160). Format per tRNA:
+    /// `<seqname>.t<id> (<begin>-<end>):\n<seq>\n<ss>\n\n`. The seq/ss/coords are
+    /// byte-identical to C. The id, however, is C's PRESCAN counter
+    /// (`$r_curseq_trnact`, CM.pm:3359) — incremented per above-cutoff second-pass
+    /// hit BEFORE the overlap dedup. It CANNOT be reproduced from R's data: C and
+    /// infernox agree on the final deduped hit set but emit DIFFERENT transient
+    /// overlapping raw hits (at different loci) that the dedup later removes, so C's
+    /// pre-dedup counter reaches a different value (e.g. C `.t28` vs R final `.t27`
+    /// for the same Undet). Matching it would require raw-hit-level parity between
+    /// the engines, which they do not share. We therefore emit the final display id.
+    pub fn write_faithful_odd_struct<W: Write>(&self, writer: &mut W) -> IoResult<()> {
+        for t in &self.trna_results {
+            if t.anticodon != "NNN" && t.isotype != "Undet" {
+                continue;
+            }
+            // C prints raw `$trna->start()."-".$trna->end()` (ascending), like ACeDB.
+            write!(
+                writer,
+                "{}.t{} ({}-{}):\n{}\n{}\n\n",
+                t.seqname, t.id, t.start, t.end, t.seq, t.ss
+            )?;
         }
         Ok(())
     }
@@ -3405,18 +4041,18 @@ impl TrnaScanner {
             let strand = t.strand.as_str();
             write!(
                 writer,
-                "{}\ttRNAscan-SE\t{}\t{}\t{}\t{:.1}\t{}\t.\tID={}.trna{};Name={};isotype={};anticodon={};gene_biotype={};\n",
+                "{}\ttrnascan-rs\t{}\t{}\t{}\t{:.1}\t{}\t.\tID={}.trna{};Name={};isotype={};anticodon={};gene_biotype={};\n",
                 t.seqname, biotype, t.start, t.end, t.score, strand,
                 t.seqname, t.id, name, t.isotype, t.anticodon, biotype,
             )?;
             if t.introns.is_empty() {
                 write!(
                     writer,
-                    "{}\ttRNAscan-SE\texon\t{}\t{}\t.\t{}\t.\tID={}.trna{}.exon1;Parent={}.trna{};\n",
+                    "{}\ttrnascan-rs\texon\t{}\t{}\t.\t{}\t.\tID={}.trna{}.exon1;Parent={}.trna{};\n",
                     t.seqname, t.start, t.end, strand, t.seqname, t.id, t.seqname, t.id,
                 )?;
             } else if strand == "+" {
-                write!(writer, "{}\ttRNAscan-SE\texon\t{}\t", t.seqname, t.start)?;
+                write!(writer, "{}\ttrnascan-rs\texon\t{}\t", t.seqname, t.start)?;
                 for (i, intron) in t.introns.iter().enumerate() {
                     write!(
                         writer,
@@ -3425,7 +4061,7 @@ impl TrnaScanner {
                     )?;
                     write!(
                         writer,
-                        "{}\ttRNAscan-SE\texon\t{}\t",
+                        "{}\ttrnascan-rs\texon\t{}\t",
                         t.seqname,
                         intron.end + 1
                     )?;
@@ -3440,14 +4076,14 @@ impl TrnaScanner {
                 for (i, intron) in t.introns.iter().enumerate() {
                     write!(
                         writer,
-                        "{}\ttRNAscan-SE\texon\t{}\t{}\t.\t{}\t.\tID={}.trna{}.exon{};Parent={}.trna{};\n",
+                        "{}\ttrnascan-rs\texon\t{}\t{}\t.\t{}\t.\tID={}.trna{}.exon{};Parent={}.trna{};\n",
                         t.seqname, intron.end + 1, end, strand, t.seqname, t.id, i + 1, t.seqname, t.id,
                     )?;
                     end = intron.start - 1;
                 }
                 write!(
                     writer,
-                    "{}\ttRNAscan-SE\texon\t{}\t{}\t.\t{}\t.\tID={}.trna{}.exon{};Parent={}.trna{};\n",
+                    "{}\ttrnascan-rs\texon\t{}\t{}\t.\t{}\t.\tID={}.trna{}.exon{};Parent={}.trna{};\n",
                     t.seqname, t.start, end, strand, t.seqname, t.id, t.introns.len() + 1, t.seqname, t.id,
                 )?;
             }
@@ -3501,13 +4137,7 @@ impl TrnaScanner {
     /// first-pass / second-pass blocks above it carry timestamps + CPU times and are
     /// inherently non-reproducible; this method emits only the deterministic block.
     pub fn write_faithful_stats<W: Write>(&self, writer: &mut W) -> IoResult<()> {
-        // Isotype order + anticodon layout — GeneticCode.pm initialize (:38/:46).
-        #[allow(dead_code)]
-        const ISOTYPES: [&str; 22] = [
-            "Ala", "Gly", "Pro", "Thr", "Val", "Ser", "Arg", "Leu", "Phe", "Asn",
-            "Lys", "Asp", "Glu", "His", "Gln", "Ile", "Met", "Tyr", "Supres", "Cys",
-            "Trp", "SelCys",
-        ];
+        // Anticodon layout — GeneticCode.pm initialize (:38/:46).
         const AC_LIST: [(&str, &[&str]); 22] = [
             ("Ala", &["AGC", "GGC", "CGC", "TGC"]),
             ("Gly", &["ACC", "GCC", "CCC", "TCC"]),
@@ -3676,7 +4306,11 @@ impl TrnaScanner {
 
         // Faithful in-process Infernal pipeline for bacterial/archaeal/general modes.
         if self.uses_faithful() {
-            if seq.len() >= 60 {
+            if matches!(self.mode, ScanMode::Mitochondrial) {
+                // Mito: per-isotype mito CM scan on the WHOLE sequence (C analyze_mito).
+                let trnas = self.faithful_scan_sequence_mito(seq, &sqinfo.name, seq.len());
+                self.trna_results.extend(trnas);
+            } else if seq.len() >= 60 {
                 let trnas = self.faithful_scan_sequence(seq, &sqinfo.name, seq.len());
                 self.trna_results.extend(trnas);
             }
@@ -3823,7 +4457,7 @@ impl TrnaScanner {
 
     /// Write statistics summary
     pub fn write_statistics<W: Write>(&self, writer: &mut W) -> IoResult<()> {
-        writeln!(writer, "tRNAscan-SE Statistics")?;
+        writeln!(writer, "trnascan-rs Statistics")?;
         writeln!(writer, "Total tRNAs: {}", self.results.len())?;
 
         // Count by isotype
@@ -3859,6 +4493,93 @@ impl TrnaScanner {
         }
         Ok(())
     }
+
+    /// Sorted (ASCII, Perl `sort`) list of isotype-CM model basenames — the `.iso`
+    /// column order and header. Sourced from the loaded isotype fleet
+    /// (`TRNAinf-<clade>-iso`, split per model, `bact-`/`arch-`/`euk-` prefix
+    /// stripped), matching C `get_models` + `sort keys %$iso_models`.
+    fn iso_model_names(&self) -> Vec<String> {
+        self.ensure_iso_res();
+        let res_ref = self.iso_res.borrow();
+        let mut names: Vec<String> = match res_ref.as_ref() {
+            Some(r) => r.iso.iter().map(|(n, _)| n.clone()).collect(),
+            None => Vec::new(),
+        };
+        names.sort();
+        names
+    }
+
+    /// Write the `-s`/`--isospecific` `.iso` isotype-score matrix (faithful port of
+    /// C ScanResult.pm `print_isotype_specific_header` + `construct_isotype_specific_output`).
+    ///
+    /// Header: `tRNAscanID<TAB>Anticodon_predicted_isotype` then one column per
+    /// isotype model (ASCII-sorted basename). Body: one row per tRNA
+    /// (`<seqname>.trna<id>`, matching the `.gff`/`.out` IDs, then the predicted
+    /// isotype, then the CM bit score against each model — the tblout score for a
+    /// reported hit, `-999` for a model with no reported hit).
+    pub fn write_faithful_iso<W: Write>(&self, writer: &mut W) -> IoResult<()> {
+        let models = self.iso_model_names();
+
+        // Header line (C print_isotype_specific_header).
+        write!(writer, "tRNAscanID\tAnticodon_predicted_isotype")?;
+        for name in &models {
+            write!(writer, "\t{}", name)?;
+        }
+        writeln!(writer)?;
+
+        // One row per tRNA (C construct_isotype_specific_output).
+        for t in &self.trna_results {
+            write!(writer, "{}.trna{}\t{}", t.seqname, t.id, t.isotype)?;
+            for name in &models {
+                match t.iso_all_scores.iter().find(|(m, _)| m == name) {
+                    // C prints the stored tblout score for a model that produced a hit.
+                    Some((_, score)) => write!(writer, "\t{:.1}", score)?,
+                    // C prints "-999" for a model with no (reported) hit.
+                    None => write!(writer, "\t-999")?,
+                }
+            }
+            writeln!(writer)?;
+        }
+        Ok(())
+    }
+}
+
+/// Reverse-complement a nucleotide string (faithful port of C
+/// `Utils.pm::rev_comp_seq` + `%comp_map`, IUPAC uppercase). Used by `--codons`
+/// to turn a stored (uppercase) anticodon into its codon.
+fn rev_comp_seq(seq: &str) -> String {
+    seq.chars()
+        .rev()
+        .map(|c| match c {
+            'A' => 'T', 'T' => 'A', 'U' => 'A',
+            'G' => 'C', 'C' => 'G',
+            'Y' => 'R', 'R' => 'Y',
+            'S' => 'S', 'W' => 'W',
+            'M' => 'K', 'K' => 'M',
+            'B' => 'V', 'V' => 'B',
+            'H' => 'D', 'D' => 'H',
+            'N' => 'N', 'X' => 'X',
+            '?' => '?', '-' => '-',
+            other => other,
+        })
+        .collect()
+}
+
+/// One-letter amino-acid code for an isotype, as C's `one_let_trans_map`
+/// (GeneticCode.pm): the 20 standard 3-letter codes, `Undet`/`Sup` → `?`,
+/// `SeC` → `Z`. Met-family aliases (`fMet`/`iMet`/`Ile2`) are NOT in the map, so
+/// C interpolates the empty string — represented here as `None`.
+fn acedb_one_letter(isotype: &str) -> Option<char> {
+    match isotype {
+        "Ala" => Some('A'), "Cys" => Some('C'), "Asp" => Some('D'), "Glu" => Some('E'),
+        "Phe" => Some('F'), "Gly" => Some('G'), "His" => Some('H'), "Ile" => Some('I'),
+        "Lys" => Some('K'), "Leu" => Some('L'), "Met" => Some('M'), "Asn" => Some('N'),
+        "Pro" => Some('P'), "Gln" => Some('Q'), "Arg" => Some('R'), "Ser" => Some('S'),
+        "Thr" => Some('T'), "Val" => Some('V'), "Trp" => Some('W'), "Tyr" => Some('Y'),
+        "SeC" | "SelCys" => Some('Z'),
+        "Undet" | "Sup" | "Supres" | "???" => Some('?'),
+        _ => None,
+    }
 }
 
 /// Write the 9-column `-B` `.out` header (default: no `-H`, no `--detail`).
@@ -3871,11 +4592,16 @@ fn write_faithful_header<W: Write>(
     l: usize,
     hmm: bool,
     detail: bool,
+    output_codon: bool,
 ) -> IoResult<()> {
     // Line 1: base through "Inf", then conditional blocks, then the Note spacer.
+    // C ScanResult.pm:99-106: the column-1 header label is "Anti" normally, or
+    // "   " (3 spaces) under `--codons` (`$codon_label`); the line-2 "Codon"
+    // label is unconditional.
+    let codon_label = if output_codon { "   " } else { "Anti" };
     write!(
         writer,
-        "{:<w$}\t\t{:<l$}\t{:<l$}\ttRNA\tAnti\tIntron Bounds\tInf",
+        "{:<w$}\t\t{:<l$}\t{:<l$}\ttRNA\t{codon_label}\tIntron Bounds\tInf",
         "Sequence", "tRNA", "Bounds", w = w, l = l
     )?;
     if hmm {

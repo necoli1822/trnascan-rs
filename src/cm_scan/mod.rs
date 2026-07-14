@@ -13,32 +13,10 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::Command;
 
-use infernal::{cm_file_read, cmsearch, SearchHit, CM};
-use infernal::{FaithfulConfig, FaithfulSearcher};
-
-/// Check if a command exists in PATH
-#[allow(dead_code)]
-fn which_cmd(cmd: &str) -> Result<PathBuf, std::io::Error> {
-    Command::new("which")
-        .arg(cmd)
-        .output()
-        .and_then(|output| {
-            if output.status.success() {
-                let path = String::from_utf8_lossy(&output.stdout)
-                    .trim()
-                    .to_string();
-                Ok(PathBuf::from(path))
-            } else {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "command not found",
-                ))
-            }
-        })
-}
-use easel::error::InfernalError;
+use infernox::{cm_file_read, CM};
+use infernox::{FaithfulConfig, FaithfulHit, FaithfulSearcher};
+use infernox::easel::error::InfernalError;
 
 use crate::trna::{Strand, TRna, Intron, AnticodonPos, TRnaCategory};
 
@@ -269,22 +247,43 @@ impl CMSearchHit {
         }
     }
 
-    /// Create CMSearchHit from Infernal SearchHit
-    pub fn from_search_hit(hit: &SearchHit, model_name: &str, target_name: &str, target_len: i64) -> Self {
-        CMSearchHit {
-            target_name: target_name.to_string(),
-            target_len,
-            query_name: model_name.to_string(),
-            seq_from: hit.start as i64,
-            seq_to: hit.end as i64,
-            score: hit.score as f64,
-            strand: '+',  // Infernal returns hits on + strand by default
-            trunc: "no".to_string(),
-            pass: 1,
-            inc: '!',
-            model: model_name.to_string(),
-            ..Default::default()
+    /// Create CMSearchHit from a faithful infernox `FaithfulHit`.
+    ///
+    /// Replaces the former `from_search_hit(&SearchHit)` (the legacy `cmsearch()`
+    /// API was removed when infernox's pre-parity `legacy/` modules were deleted).
+    /// Mirrors the exact column mapping `batch_search_external` produces — so the
+    /// strand-oriented coords, evalue/bias/gc, and model span are now filled in
+    /// (the old converter hard-coded '+' strand and left evalue/bias blank).
+    pub fn from_faithful_hit(hit: &FaithfulHit, model_name: &str, target_name: &str, target_len: i64) -> Self {
+        let mut h = CMSearchHit::default();
+        h.target_name = target_name.to_string();
+        h.query_name = model_name.to_string();
+        h.model = model_name.to_string();
+        h.target_len = target_len;
+        h.seq_from = hit.start;
+        h.seq_to = hit.stop;
+        h.strand = if hit.in_rc { '-' } else { '+' };
+        h.score = hit.score as f64;
+        h.evalue = hit.evalue;
+        h.bias = hit.bias as f64;
+        h.gc = hit.gc;
+        h.mdl_from = hit.mdl_from;
+        h.mdl_to = hit.mdl_to;
+        h.trunc = "no".to_string();
+        h.pass = 1;
+        h.inc = if hit.evalue <= 0.01 { '!' } else { '?' };
+
+        // Parse isotype/anticodon from query name (e.g. "tRNA-Ala-TGC").
+        if h.query_name.contains("tRNA-") {
+            let parts: Vec<&str> = h.query_name.split('-').collect();
+            if parts.len() >= 2 {
+                h.isotype = parts[1].to_string();
+            }
+            if parts.len() >= 3 {
+                h.anticodon = parts[2].to_string();
+            }
         }
+        h
     }
 
     /// Get the hit length
@@ -511,27 +510,30 @@ impl CMScan {
         self.search_with_cm(&cm_path, seq, seq_name)
     }
 
-    /// Run cmsearch with a specific CM file
+    /// Run cmsearch with a specific CM file, in-process via the faithful infernox
+    /// pipeline (byte-parity with C Infernal). Replaces the removed legacy
+    /// `cmsearch(&cm, ...)` single-sequence API with `FaithfulSearcher`.
     pub fn search_with_cm(
         &mut self,
         cm_path: &PathBuf,
         seq: &str,
         seq_name: &str,
     ) -> Result<Vec<CMSearchHit>, String> {
-        // Load CM directly without caching to avoid borrow issues
-        let path_str = cm_path.to_string_lossy().to_string();
-        let cm = cm_file_read(&path_str)
-            .map_err(|e: InfernalError| format!("Failed to read CM file {}: {}", path_str, e))?;
+        // Build the faithful searcher (reads CM in global config, builds p7
+        // filters + CP9 HMM + configures CM scores).
+        let searcher = FaithfulSearcher::from_cm_file(cm_path).map_err(|e| {
+            format!("Failed to build faithful searcher from {}: {}", cm_path.display(), e)
+        })?;
+        let model_name = searcher.model_name().to_string();
 
-        let model_name = cm.name.clone();
+        let seqs = [seq];
+        let cfg = FaithfulConfig::default();
+        let fhits = searcher.search(&seqs, &cfg);
+        let target_len = seq.len() as i64;
 
-        // Run cmsearch using Infernal library
-        let result = cmsearch(&cm, seq, seq_name)?;
-
-        // Convert results to CMSearchHit
-        let hits: Vec<CMSearchHit> = result.hits.iter()
+        let hits: Vec<CMSearchHit> = fhits.iter()
             .filter(|h| h.score as f64 >= self.options.score_cutoff)
-            .map(|h| CMSearchHit::from_search_hit(h, &model_name, seq_name, seq.len() as i64))
+            .map(|h| CMSearchHit::from_faithful_hit(h, &model_name, seq_name, target_len))
             .collect();
 
         Ok(hits)
@@ -698,65 +700,6 @@ impl CMScan {
             .collect();
 
         Ok(results)
-    }
-
-    /// Parse cmsearch tblout format
-    #[allow(dead_code)]
-    fn parse_tblout(&self, path: &PathBuf) -> Result<Vec<CMSearchHit>, String> {
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| format!("Failed to read tblout file: {}", e))?;
-
-        let mut hits = Vec::new();
-
-        for line in content.lines() {
-            // Skip comments and empty lines
-            if line.starts_with('#') || line.trim().is_empty() {
-                continue;
-            }
-
-            // Parse fields (space-separated)
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            if fields.len() < 18 {
-                continue;
-            }
-
-            // Fields: target_name, accession, query_name, accession,
-            //         mdl, mdl_from, mdl_to, seq_from, seq_to,
-            //         strand, trunc, pass, gc, bias, score, e_value, inc, description
-            let target_name = fields[0].to_string();
-            let query_name = fields[2].to_string();
-            let seq_from: i64 = fields[7].parse().unwrap_or(0);
-            let seq_to: i64 = fields[8].parse().unwrap_or(0);
-            let strand_char = fields[9];
-            let score: f64 = fields[14].parse().unwrap_or(0.0);
-            let evalue: f64 = fields[15].parse().unwrap_or(1.0);
-
-            let strand = if strand_char == "+" { '+' } else { '-' };
-
-            let mut hit = CMSearchHit::default();
-            hit.target_name = target_name;
-            hit.query_name = query_name;
-            hit.seq_from = seq_from;
-            hit.seq_to = seq_to;
-            hit.strand = strand;
-            hit.score = score;
-            hit.evalue = evalue;
-
-            // Parse isotype from query name (e.g., "tRNA-Ala-TGC")
-            if hit.query_name.contains("tRNA-") {
-                let parts: Vec<&str> = hit.query_name.split('-').collect();
-                if parts.len() >= 2 {
-                    hit.isotype = parts[1].to_string();
-                }
-                if parts.len() >= 3 {
-                    hit.anticodon = parts[2].to_string();
-                }
-            }
-
-            hits.push(hit);
-        }
-
-        Ok(hits)
     }
 
     // ========================================================================

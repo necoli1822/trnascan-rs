@@ -452,6 +452,18 @@ static TRANS_MAP: Lazy<BTreeMap<String, String>> = Lazy::new(|| {
 /// `cm_model_name` is the CM's model name (`"Domain"`, `"SeC"`, ...). `is_sec_cm`
 /// short-circuits to `"SeC"` (the Perl `Pselc`/`Eselc` file-path check).
 pub fn get_trna_type(anticodon: &str, cm_model_name: &str, is_sec_cm: bool, cove_mode: bool) -> String {
+    get_trna_type_with_map(&TRANS_MAP, anticodon, cm_model_name, is_sec_cm, cove_mode)
+}
+
+/// Shared body of `GeneticCode.pm::get_tRNA_type` (:267), parameterized on the
+/// active anticodon->isotype map (standard vs. an alt-gcode-overridden map).
+fn get_trna_type_with_map(
+    map: &BTreeMap<String, String>,
+    anticodon: &str,
+    cm_model_name: &str,
+    is_sec_cm: bool,
+    cove_mode: bool,
+) -> String {
     if anticodon == UNDEF_ANTICODON {
         return UNDEF_ISOTYPE.to_string();
     }
@@ -461,7 +473,7 @@ pub fn get_trna_type(anticodon: &str, cm_model_name: &str, is_sec_cm: bool, cove
     let mut prev: Option<String> = None; // None models Perl 'INIT'
     let mut typ = UNDEF_ISOTYPE.to_string();
     for exp in expand_ambig(&anticodon.to_uppercase()) {
-        typ = TRANS_MAP
+        typ = map
             .get(&exp)
             .cloned()
             .unwrap_or_else(|| UNDEF_ISOTYPE.to_string());
@@ -476,6 +488,27 @@ pub fn get_trna_type(anticodon: &str, cm_model_name: &str, is_sec_cm: bool, cove
         prev = Some(typ.clone());
     }
     typ
+}
+
+/// The vertebrate-mitochondrial anticodon->isotype map: the standard [`TRANS_MAP`]
+/// overridden by `gcode.vertmito` (GeneticCode.pm::read_transl_table:219-264, driver
+/// :1189 loads gc_vert_mito with alt_gcode for BOTH `-M vert` and `-M mammal`). Each
+/// override key is `expand_ambig(rev_comp_seq(codon))`:
+///   TGA->Trp => anticodon TCA->Trp   (standard TCA->SeC is replaced)
+///   ATA->Met => anticodon TAT->Met
+///   AGR->Stp => anticodons TCT,CCT->Stp
+static MITO_TRANS_MAP: Lazy<BTreeMap<String, String>> = Lazy::new(|| {
+    let mut m = TRANS_MAP.clone();
+    m.insert("TCA".to_string(), "Trp".to_string());
+    m.insert("TAT".to_string(), "Met".to_string());
+    m.insert("TCT".to_string(), "Stp".to_string());
+    m.insert("CCT".to_string(), "Stp".to_string());
+    m
+});
+
+/// `get_tRNA_type` under the vertebrate-mitochondrial genetic code (`-M` mode).
+pub fn get_mito_trna_type(anticodon: &str, cm_model_name: &str) -> String {
+    get_trna_type_with_map(&MITO_TRANS_MAP, anticodon, cm_model_name, false, false)
 }
 
 // ============================================================================
@@ -556,6 +589,319 @@ pub fn decode_trna_properties(
         antiloop_end,
         ac_pos,
         intron,
+        norm_seq,
+        norm_ss,
+    }
+}
+
+// ============================================================================
+// Mitochondrial decode — CM.pm::find_mito_anticodon (:799) +
+// decode_mito_tRNA_properties (:1482)
+// ============================================================================
+
+/// The four mito anticodon-stem-loop regexes from `CM.pm::find_mito_anticodon`
+/// (:817/824/831/838), operating on the normalized ss. These differ from the
+/// nuclear `AC_RE`: the mito set adds "No D-arm" / "No T-arm" tolerant patterns
+/// and a more permissive final branch (no required `>` after the D-stem).
+static MITO_AC_RE_NODARM_SER: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^([>.]+)>([.]{4,})<+.+[>.]+<[<.]+").unwrap());
+static MITO_AC_RE_NOTARM: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^([>.]+<[<.]+[>.]*)>([.]{4,})<[<.]+[.]{4,}<[<.]+$").unwrap());
+static MITO_AC_RE_NODARM: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^([>.]+[.]{4,}[>.]+)>([.]{4,})<[<.]+\.+[>.]+<[<.]+$").unwrap());
+static MITO_AC_RE_STD: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^([>.]+<[<.]+[>.]*)>([.]{4,})<+.+[>.]+<[<.]+").unwrap());
+
+/// Result of [`find_mito_anticodon`], mirroring the Perl side-effects.
+#[derive(Debug, Clone)]
+pub struct MitoAnticodon {
+    pub anticodon: String,
+    pub antiloop_index: i32,
+    pub antiloop_end: i32,
+    /// 1-based position of the anticodon's first base (`ac_index+antiloop_index+1`).
+    pub ac_pos: i32,
+    /// `trna->note()` side-effect ("No D-arm" / "No T-arm" / "").
+    pub note: String,
+    /// `trna->category()` side-effect ("undetermined_ac" / "mito_ac_mislocation" / "").
+    pub category: String,
+}
+
+/// True if the CM model key is consistent with a decoded isotype (CM.pm:872/920).
+fn mito_model_iso_match(model: &str, isotype: &str) -> bool {
+    model == isotype
+        || (model == "SerGCT" && isotype == "Ser")
+        || (model == "SerTGA" && isotype == "Ser")
+        || (model == "LeuTAG" && isotype == "Leu")
+        || (model == "LeuTAA" && isotype == "Leu")
+        || (model == "Cys_NoDarm" && isotype == "Cys")
+}
+
+/// Perl `substr($s, $off, $len)` on a byte string, clamped like Perl (offset past
+/// end => empty; len past end => truncated). `off` must be >= 0.
+fn perl_substr(s: &[u8], off: usize, len: usize) -> String {
+    if off >= s.len() {
+        return String::new();
+    }
+    let end = (off + len).min(s.len());
+    String::from_utf8_lossy(&s[off..end]).to_string()
+}
+
+/// Port of `CM.pm::find_mito_anticodon` (:799).
+///
+/// `norm_seq`/`norm_ss` are the normalized (post-`format_cmsearch_output`) strings;
+/// `model` is the CM key (e.g. `"Pro"`, `"SerGCT"`, `"Cys_NoDarm"`). Returns the
+/// decoded anticodon plus the note/category side-effects the Perl sets on the tRNA.
+pub fn find_mito_anticodon(norm_seq: &str, norm_ss: &str, model: &str) -> MitoAnticodon {
+    let seq = norm_seq.as_bytes();
+    let mut note = String::new();
+    let mut antiloop_index: usize = 0;
+    let mut antiloop_len: usize = 0;
+
+    // Match one of the four stem-loop patterns, in priority order (CM.pm:817-843).
+    if model == "SerGCT" || model == "Cys_NoDarm" {
+        if let Some(c) = MITO_AC_RE_NODARM_SER.captures(norm_ss) {
+            antiloop_index = c.get(1).unwrap().as_str().len() + 1;
+            antiloop_len = c.get(2).unwrap().as_str().len();
+            note = "No D-arm".to_string();
+        }
+    }
+    if antiloop_index == 0 {
+        if let Some(c) = MITO_AC_RE_NOTARM.captures(norm_ss) {
+            antiloop_index = c.get(1).unwrap().as_str().len() + 1;
+            antiloop_len = c.get(2).unwrap().as_str().len();
+            note = "No T-arm".to_string();
+        } else if let Some(c) = MITO_AC_RE_NODARM.captures(norm_ss) {
+            antiloop_index = c.get(1).unwrap().as_str().len() + 1;
+            antiloop_len = c.get(2).unwrap().as_str().len();
+            note = "No D-arm".to_string();
+        } else if let Some(c) = MITO_AC_RE_STD.captures(norm_ss) {
+            antiloop_index = c.get(1).unwrap().as_str().len() + 1;
+            antiloop_len = c.get(2).unwrap().as_str().len();
+        }
+    }
+
+    let undet = || MitoAnticodon {
+        anticodon: UNDEF_ANTICODON.to_string(),
+        antiloop_index: -1,
+        antiloop_end: -1,
+        ac_pos: -1,
+        note: note.clone(),
+        category: "undetermined_ac".to_string(),
+    };
+
+    if antiloop_index == 0 || antiloop_len == 0 {
+        return undet();
+    }
+
+    let antiloop_end = antiloop_index + antiloop_len - 1;
+    // antiloop = substr(seq, antiloop_index, antiloop_len); strip '-' gaps; uc.
+    let raw_loop = perl_substr(seq, antiloop_index, antiloop_len);
+    let antiloop: Vec<u8> = raw_loop
+        .bytes()
+        .filter(|&b| b != b'-')
+        .map(|b| b.to_ascii_uppercase())
+        .collect();
+
+    let mut category = String::new();
+    let anticodon: String;
+    let ac_index: usize;
+    let mut verify_ac: String;
+
+    if antiloop.len() < 5 {
+        return undet();
+    } else if antiloop.len() % 2 == 0 {
+        // Even-length loop: search for a model-consistent triplet (CM.pm:863-897).
+        let n = antiloop.len();
+        let mut found = false;
+        let mut fi: i64 = ((n as i64 - 3) / 2) as i64;
+        let mut j: i64 = 0;
+        let mut cur_ai: usize = 0;
+        let mut cur_ac = String::new();
+        while fi <= (n as i64 - 3) && fi >= 0 {
+            cur_ai = fi as usize;
+            cur_ac = String::from_utf8_lossy(&antiloop[cur_ai..cur_ai + 3]).to_string();
+            let iso = get_mito_trna_type(&cur_ac, model);
+            if mito_model_iso_match(model, &iso) {
+                category = "mito_ac_mislocation".to_string();
+                found = true;
+                break;
+            }
+            j = j.abs();
+            j += 1;
+            if j % 2 == 0 {
+                j = -j;
+            }
+            fi += j;
+        }
+        if !found {
+            return undet();
+        }
+        ac_index = cur_ai;
+        anticodon = cur_ac;
+        verify_ac = perl_substr(seq, ac_index + antiloop_index, 3).to_ascii_uppercase();
+    } else {
+        // Odd-length loop: centered triplet, with a consistency re-search
+        // (CM.pm:898-940).
+        let n = antiloop.len();
+        let mut cur_ai = (n - 3) / 2;
+        let mut cur_ac = String::from_utf8_lossy(&antiloop[cur_ai..cur_ai + 3]).to_string();
+        verify_ac = perl_substr(seq, cur_ai + antiloop_index, 3).to_ascii_uppercase();
+        let iso = get_mito_trna_type(&cur_ac, model);
+        let model_iso: &str = if model.len() > 3 { &model[0..3] } else { model };
+        if iso != model_iso {
+            verify_ac = String::new();
+            let mut found = false;
+            let mut fi: i64 = ((n as i64 - 3) / 2) - 1;
+            let mut j: i64 = 1;
+            while fi <= (n as i64 - 3) && fi >= 0 {
+                cur_ai = fi as usize;
+                cur_ac = String::from_utf8_lossy(&antiloop[cur_ai..cur_ai + 3]).to_string();
+                let iso2 = get_mito_trna_type(&cur_ac, model);
+                if mito_model_iso_match(model, &iso2) {
+                    category = "mito_ac_mislocation".to_string();
+                    found = true;
+                    break;
+                }
+                j = j.abs();
+                j += 1;
+                if j % 2 == 1 {
+                    j = -j;
+                }
+                fi += j;
+            }
+            if found {
+                verify_ac = perl_substr(seq, cur_ai + antiloop_index, 3).to_ascii_uppercase();
+            }
+        }
+        ac_index = cur_ai;
+        anticodon = cur_ac;
+    }
+
+    // verify_ac must equal the loop-derived anticodon (CM.pm:946).
+    if verify_ac != anticodon {
+        return MitoAnticodon {
+            anticodon: UNDEF_ANTICODON.to_string(),
+            antiloop_index: -1,
+            antiloop_end: -1,
+            ac_pos: -1,
+            note,
+            category: "undetermined_ac".to_string(),
+        };
+    }
+
+    MitoAnticodon {
+        anticodon,
+        antiloop_index: antiloop_index as i32,
+        antiloop_end: antiloop_end as i32,
+        ac_pos: (ac_index + antiloop_index + 1) as i32,
+        note,
+        category,
+    }
+}
+
+/// The result of the mito property decode (CM.pm:decode_mito_tRNA_properties:1482).
+///
+/// Note: `decode_mito_tRNA_properties` computes intron bounds into LOCAL variables
+/// (CM.pm:1517-1531) that are never stored on the tRNA, so mito tRNAs carry NO
+/// intron and the `.out` Intron Bounds are always `0  0`. We therefore do not
+/// expose an intron here.
+#[derive(Debug, Clone)]
+pub struct DecodedMitoTrna {
+    /// Anticodon (uppercase T-form) or `"NNN"`.
+    pub anticodon: String,
+    /// Output Type = the model-key isotype (first 3 chars). CM.pm:1595.
+    pub isotype: String,
+    /// `trna->note()` value after the decode's "(...)" prepends (CM.pm:1560-1584).
+    pub note: String,
+    /// `trna->category()` value (used only by the `--detail` mito Note column,
+    /// ScanResult.pm:843-857). Empty when consistent.
+    pub category: String,
+    pub norm_seq: String,
+    pub norm_ss: String,
+}
+
+/// `vert_mito_aa_list` (GeneticCode.pm:114): anticodon -> isotype for the
+/// vertebrate-mito expected-anticodon check (CM.pm:1534/1587).
+fn vert_mito_type(ac: &str) -> &'static str {
+    match ac {
+        "TGC" => "Ala", "TCC" => "Gly", "TGG" => "Pro", "TGT" => "Thr", "TAC" => "Val",
+        "TGA" => "Ser", "GCT" => "Ser", "TCG" => "Arg", "TAG" => "Leu", "TAA" => "Leu",
+        "GAA" => "Phe", "GTT" => "Asn", "TTT" => "Lys", "GTC" => "Asp", "TTC" => "Glu",
+        "GTG" => "His", "TTG" => "Gln", "GTA" => "Tyr", "GAT" => "Ile", "TAT" => "Met",
+        "CAT" => "Met", "GCA" => "Cys", "TCA" => "Trp", "GCC" => "Asp",
+        _ => "",
+    }
+}
+
+/// Port of `CM.pm::decode_mito_tRNA_properties` (:1482).
+///
+/// `ali` is the normalized-input alidisplay for the winning model; `model` is the
+/// CM key. Intron bounds are computed-but-discarded in the Perl, so no intron is
+/// returned (see [`DecodedMitoTrna`]).
+#[allow(non_snake_case)] // mirrors the C `decode_mito_tRNA_properties` sub name
+pub fn decode_mito_tRNA_properties(ali: &AliDisplay, model: &str) -> DecodedMitoTrna {
+    let (norm_ss, norm_seq) = format_cmsearch_output(&ali.ss_cons, &ali.aseq, &ali.nc);
+    let ac = find_mito_anticodon(&norm_seq, &norm_ss, model);
+    let mut note = ac.note.clone();
+    let mut category = ac.category.clone();
+
+    // check for problem parsing anticodon loop (CM.pm:1501): undef => intron off.
+    let anticodon = if ac.anticodon == UNDEF_ANTICODON {
+        UNDEF_ANTICODON.to_string()
+    } else {
+        ac.anticodon.clone()
+    };
+
+    // isotype = get_tRNA_type(anticodon, model) (CM.pm:1533).
+    let isotype_decoded = get_mito_trna_type(&anticodon, model);
+    let vert_iso = vert_mito_type(&anticodon);
+
+    // model_iso / model_ac extraction (CM.pm:1536-1554).
+    let mut model_iso = model.to_string();
+    let mut model_ac = String::new();
+    if model.len() > 3 {
+        model_iso = model[0..3].to_string();
+        if let Some(us) = model.find('_') {
+            let temp = &model[0..us];
+            if temp.len() > 3 {
+                model_ac = temp[3..].to_string();
+            }
+        } else {
+            model_ac = model[3..].to_string();
+        }
+    }
+
+    // Consistency notes (CM.pm:1555-1593). Perl prepends "(...)" only when
+    // category is still empty at that check.
+    if model_iso != isotype_decoded {
+        if category.is_empty() {
+            category = "mito_inconsistent_isotype".to_string();
+            note = if !note.is_empty() {
+                format!("({}); {}", isotype_decoded, note)
+            } else {
+                format!("({})", isotype_decoded)
+            };
+        }
+    }
+    if !model_ac.is_empty() && model_ac != anticodon {
+        if category.is_empty() {
+            category = "mito_inconsistent_ac".to_string();
+            note = if !note.is_empty() {
+                format!("({}); {}", model_ac, note)
+            } else {
+                format!("({})", model_ac)
+            };
+        }
+    }
+    if vert_iso.is_empty() && category.is_empty() {
+        // category = "mito_unexpected_ac" (no note side-effect).
+    }
+
+    DecodedMitoTrna {
+        anticodon,
+        isotype: model_iso,
+        note,
+        category,
         norm_seq,
         norm_ss,
     }

@@ -17,8 +17,6 @@ use super::{ResultError, ResultFormat};
 
 /// Generic result file reader
 pub struct ResultFileReader {
-    #[allow(dead_code)]
-    path: std::path::PathBuf,
     reader: BufReader<File>,
     format: ResultFormat,
     line_num: usize,
@@ -34,7 +32,6 @@ impl ResultFileReader {
         let format = ResultFormat::from_contents(&mut reader)?;
 
         Ok(Self {
-            path: path.to_path_buf(),
             reader,
             format,
             line_num: 0,

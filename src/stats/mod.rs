@@ -371,9 +371,54 @@ impl ScanStats {
         };
         writeln!(w, "Scan speed:             {:.1} Kbp/sec", scan_speed)?;
 
-        // Get current time for end message
+        // Get current time for end message. C: `print "\nFirst pass search(es)
+        // ended: ",`date`,"\n"` — `date` supplies one trailing newline and the extra
+        // "\n" a blank line, so a blank line follows this line (before "Infernal Stats:").
         let now = chrono::Local::now();
-        writeln!(w, "\nFirst pass search(es) ended: {}", now.format("%a %b %d %H:%M:%S %Y"))?;
+        writeln!(w, "\nFirst pass search(es) ended: {}\n", now.format("%a %b %d %H:%M:%S %Y"))?;
+
+        Ok(())
+    }
+
+    /// Save the second-pass ("Infernal Stats") block + "Overall scan speed" line, for
+    /// the faithful `.stats` writer. Faithful port of the CM-mode / infernal_fp branch
+    /// of C Stats.pm `save_final_stats` (label = "Infernal"), EXCLUDING output_summary
+    /// (the caller emits the isotype-count summary via `write_faithful_stats`). The
+    /// date / CPU-time / scan-speed lines carry runtime values (normalized in parity
+    /// checks); the labels, counts, and "% seq scanned" are deterministic.
+    pub fn save_secondpass_stats<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        let label = "Infernal";
+        writeln!(w, "{} Stats:", label)?;
+        writeln!(w, "-----------")?;
+        // C passes the first-pass hit count as prescan_count; `trnatotal` holds it.
+        writeln!(w, "Candidate tRNAs read:     {}", self.trnatotal)?;
+        writeln!(w, "{}-confirmed tRNAs:     {}", label, self.total_secpass_ct)?;
+        writeln!(w, "Bases scanned by {}:  {}", label, self.secpass_base_ct)?;
+
+        let pct_scanned = ((self.secpass_base_ct as f64
+            / (self.first_pass_base_ct * 2).max(1) as f64)
+            * 100.0)
+            .min(100.0);
+        writeln!(w, "% seq scanned by {}:  {:.1} %", label, pct_scanned)?;
+
+        writeln!(w, "Script CPU time:          {:.2} s", self.sp_script_cpu)?;
+        writeln!(w, "{} CPU time:            {:.2} s", label, self.sp_scan_cpu)?;
+
+        let scan_speed = self.secpass_base_ct as f64 / self.sp_scan_cpu.max(0.001);
+        writeln!(w, "Scan speed:               {:.1} bp/sec", scan_speed)?;
+
+        let now = chrono::Local::now();
+        writeln!(
+            w,
+            "\n{} analysis of tRNAs ended: {}\n",
+            label,
+            now.format("%a %b %d %H:%M:%S %Y")
+        )?;
+
+        let total_time = self.fp_script_cpu + self.fp_scan_cpu + self.sp_script_cpu + self.sp_scan_cpu;
+        let total_bases = (self.first_pass_base_ct * 2).max(self.secpass_base_ct);
+        let overall_speed = total_bases as f64 / total_time.max(0.001);
+        writeln!(w, "Overall scan speed: {:.1} bp/sec", overall_speed)?;
 
         Ok(())
     }

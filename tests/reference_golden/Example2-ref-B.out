@@ -1,9 +1,0 @@
-Sequence		tRNA	Bounds	tRNA	Anti	Intron Bounds	Inf	      
-Name    	tRNA #	Begin	End	Type	Codon	Begin	End	Score	Note
---------	------	-----	------	----	-----	-----	----	------	------
-MySeq1  	1	13 	85 	Thr	TGT	0	0	78.3	
-MySeq2  	1	6  	79 	Arg	TCT	0	0	63.1	
-MySeq3  	1	14 	114	Ser	CGA	51	69	47.8	
-MySeq4  	1	6  	88 	Leu	AAG	0	0	62.1	
-MySeq5  	1	3  	89 	Sup	TCA	0	0	32.2	
-MySeq6  	1	7  	92 	Lys	CTT	0	0	65.6	

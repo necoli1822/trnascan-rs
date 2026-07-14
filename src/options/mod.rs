@@ -355,6 +355,28 @@ pub struct Options {
     pub use_prev_ts_run: bool,
     /// Prompt before overwriting files
     pub prompt_for_overwrite: bool,
+
+    // --- C tRNAscan-SE flags with no prior Rust home (parse + store; some deferred) ---
+    /// --mt <model>: mito tRNA models for cytosolic/mito determination
+    pub mt_model: String,
+    /// -L: legacy search method (tRNAscan + EufindtRNA + COVE)
+    pub legacy_mode: bool,
+    /// -D --nopseudo: disable pseudogene checking
+    pub disable_pseudo: bool,
+    /// -U: search using alternate models defined in config file
+    pub use_alternate_models: bool,
+    /// --nomerge: keep redundant tRNAscan 1.3 hits
+    pub nomerge: bool,
+    /// -c --conf: configuration file path
+    pub conf_file: String,
+    /// -p --prefix: default-output-file name prefix
+    pub output_prefix: String,
+    /// --tmode <mode>: explicit tRNAscan param mode (R or S)
+    pub tscan_strictness: String,
+    /// --emode <mode>: explicit EufindtRNA param mode (R, N, or S)
+    pub eufind_strictness: String,
+    /// --iscore <score>: manual EufindtRNA intermediate cutoff score
+    pub eufind_intermediate_score: Option<f64>,
 }
 
 impl Default for Options {
@@ -441,6 +463,18 @@ impl Default for Options {
             // File handling
             use_prev_ts_run: false,
             prompt_for_overwrite: true,
+
+            // C flags with no prior Rust home
+            mt_model: String::new(),
+            legacy_mode: false,
+            disable_pseudo: false,
+            use_alternate_models: false,
+            nomerge: false,
+            conf_file: String::new(),
+            output_prefix: String::new(),
+            tscan_strictness: String::new(),
+            eufind_strictness: String::new(),
+            eufind_intermediate_score: None,
         }
     }
 }
