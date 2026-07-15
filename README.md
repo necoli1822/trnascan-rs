@@ -100,6 +100,11 @@ To build against a local `infernox` checkout instead of the published crate, add
 
 ## Changelog
 
+### 0.2.1
+- Bumped the `infernox` engine to 0.2.0, which adds a striped-SSE (Farrar)
+  Viterbi filter to the covariance-model search. Output is byte-identical to
+  0.2.0; the CM stage is faster on SSE2-capable x86-64.
+
 ### 0.2.0
 - Faithful, byte-parity Rust port of tRNAscan-SE 2.0 for `-B`/`-A` genomes,
   with the covariance-model stage provided in-process by `infernox` (Infernal

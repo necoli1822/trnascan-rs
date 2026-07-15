@@ -325,9 +325,9 @@ dependencies = [
 
 [[package]]
 name = "infernox"
-version = "0.1.4"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2439589d8d7f78e4c718d49bf310b66bab27236fd350d3444adc59e8fd51d685"
+checksum = "63592fba936cf6917cc09240964929d7884e71ef52e4e759f0fa152262066930"
 dependencies = [
  "flate2",
  "rayon",
@@ -586,7 +586,7 @@ dependencies = [
 
 [[package]]
 name = "trnascan-rs"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "chrono",
  "clap",

@@ -1,6 +1,6 @@
 [package]
 name = "trnascan-rs"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 authors = ["Sunju Kim <n.e.coli.1822@gmail.com>"]
 license = "GPL-3.0-or-later"
@@ -26,13 +26,13 @@ hostname = "0.3"
 rayon = "1.10"
 # Single-crate infernox (byte-parity Infernal cmsearch engine; exposes the
 # faithful library API FaithfulSearcher at the crate root, Easel as
-# `infernox::easel`). Requires infernox >= 0.1.4, which carries the --Fmid fix
-# (the `--mid` pass F3/F3b/F4/F4b/F5 thresholds) that keeps the arch/isotype
-# scan (e.g. Hsalinarum -A Gln) byte-identical to C; 0.1.3 dropped that hit.
-# Publish infernox 0.1.4 first, then this resolves from crates.io.
+# `infernox::easel`). Requires infernox >= 0.2.0, which adds the striped-SSE
+# Viterbi filter (byte-identical output, faster CM search) on top of the
+# --Fmid fix that keeps the arch/isotype scan (e.g. Hsalinarum -A Gln)
+# byte-identical to C.
 # For a local side-by-side source build, override with:
 #   [patch.crates-io] infernox = { path = "../infernox" }
-infernox = "0.1.4"
+infernox = "0.2.0"
 
 [dev-dependencies]
 tempfile = "3.8"
